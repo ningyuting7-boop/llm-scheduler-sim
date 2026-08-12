@@ -19,7 +19,10 @@ class MetricsSummary:
     num_requests: int
     avg_waiting_time: float
     avg_response_time: float
+    p50_response_time: float
+    p95_response_time: float
     p99_response_time: float
+    max_waiting_time: float
     throughput: float
     fairness_jain_index: float
     waiting_time_stdev: float
@@ -30,6 +33,13 @@ def _finished_requests(requests: Iterable[Request]) -> List[Request]:
     if not finished:
         raise ValueError("No finished requests to compute metrics from")
     return finished
+
+
+def percentile(values: List[float], q: float) -> float:
+    """q in [0, 100]. `values` need not be pre-sorted."""
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, int(len(ordered) * q / 100))
+    return ordered[idx]
 
 
 def jains_fairness_index(values: List[float]) -> float:
@@ -46,18 +56,19 @@ def jains_fairness_index(values: List[float]) -> float:
 def compute_summary(requests: Iterable[Request]) -> MetricsSummary:
     finished = _finished_requests(requests)
     waiting_times = [r.waiting_time for r in finished]
-    response_times = sorted(r.response_time for r in finished)
+    response_times = [r.response_time for r in finished]
 
     total_span = max(r.finish_time for r in finished) - min(r.arrival_time for r in finished)
     throughput = len(finished) / total_span if total_span > 0 else float("inf")
-
-    p99_index = min(len(response_times) - 1, int(len(response_times) * 0.99))
 
     return MetricsSummary(
         num_requests=len(finished),
         avg_waiting_time=statistics.mean(waiting_times),
         avg_response_time=statistics.mean(response_times),
-        p99_response_time=response_times[p99_index],
+        p50_response_time=percentile(response_times, 50),
+        p95_response_time=percentile(response_times, 95),
+        p99_response_time=percentile(response_times, 99),
+        max_waiting_time=max(waiting_times),
         throughput=throughput,
         fairness_jain_index=jains_fairness_index(waiting_times),
         waiting_time_stdev=statistics.pstdev(waiting_times) if len(waiting_times) > 1 else 0.0,
@@ -84,7 +95,10 @@ def print_summary(summary: MetricsSummary, label: str = "") -> None:
         f"{prefix}requests={summary.num_requests} "
         f"avg_wait={summary.avg_waiting_time:.3f} "
         f"avg_response={summary.avg_response_time:.3f} "
+        f"p50_response={summary.p50_response_time:.3f} "
+        f"p95_response={summary.p95_response_time:.3f} "
         f"p99_response={summary.p99_response_time:.3f} "
+        f"max_wait={summary.max_waiting_time:.3f} "
         f"throughput={summary.throughput:.3f} "
         f"fairness(jain)={summary.fairness_jain_index:.3f} "
         f"wait_stdev={summary.waiting_time_stdev:.3f}"

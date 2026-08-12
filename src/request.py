@@ -22,6 +22,7 @@ class Request:
     # Reserved for later scheduling algorithms; unused during the FCFS stage
     priority: int = 0
     predicted_output_len: Optional[float] = None
+    prediction_uncertainty: Optional[float] = None  # ARRS only; None treated as 0
 
     status: RequestStatus = field(default=RequestStatus.WAITING, compare=False)
     remaining_len: int = field(init=False, compare=False)

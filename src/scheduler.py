@@ -32,13 +32,17 @@ class Scheduler(ABC):
         """
         admitted: List[Request] = []
         while self.waiting and len(self.running) < self.max_batch_size:
-            request = min(self.waiting, key=self._priority_key)
+            request = min(self.waiting, key=lambda r: self._priority_key(r, current_time))
             self.waiting.remove(request)
             self.running[request.request_id] = request
             admitted.append(request)
         return admitted
 
     @abstractmethod
-    def _priority_key(self, request: Request) -> Any:
-        """Sort key used to pick the next waiting request to admit (smaller = sooner)."""
+    def _priority_key(self, request: Request, current_time: float) -> Any:
+        """Sort key used to pick the next waiting request to admit (smaller = sooner).
+
+        current_time is needed by aging-based policies (e.g. ARRS), which
+        rank requests partly by how long they've been waiting.
+        """
         raise NotImplementedError

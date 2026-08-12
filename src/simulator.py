@@ -32,29 +32,44 @@ class Simulator:
             )
 
     def run(self) -> None:
+        # Events sharing the same `time` are logically simultaneous: apply
+        # all of their state changes (arrivals added, departures stepped)
+        # *before* asking the scheduler to admit anyone. Otherwise the first
+        # event processed at a given timestamp would grab a free batch slot
+        # before the scheduler even knows the other same-timestamp requests
+        # exist, which silently defeats any policy that isn't pure FCFS.
         while self.event_queue:
-            event = heapq.heappop(self.event_queue)
-            self.current_time = event.time
-            if event.event_type is EventType.ARRIVAL:
-                self._handle_arrival(event)
-            elif event.event_type is EventType.DEPARTURE:
-                self._handle_departure(event)
+            batch_time = self.event_queue[0].time
+            needs_admission = False
+            while self.event_queue and self.event_queue[0].time == batch_time:
+                event = heapq.heappop(self.event_queue)
+                self.current_time = event.time
+                if event.event_type is EventType.ARRIVAL:
+                    needs_admission |= self._handle_arrival(event)
+                elif event.event_type is EventType.DEPARTURE:
+                    needs_admission |= self._handle_departure(event)
+            if needs_admission:
+                self._admit_waiting_requests()
 
-    def _handle_arrival(self, event: Event) -> None:
+    def _handle_arrival(self, event: Event) -> bool:
         request = self.requests[event.request_id]
         self.scheduler.add_request(request)
-        self._admit_waiting_requests()
+        return True
 
-    def _handle_departure(self, event: Event) -> None:
+    def _handle_departure(self, event: Event) -> bool:
         request = self.requests[event.request_id]
+        # step means remaining_len, if reached 0, means finished, then mark finished and notify scheduler to remove it from running queue
         finished = request.step()
         if finished:
             request.mark_finished(current_time=self.current_time)
+            # remove the request from the scheduler's running queue and notify the scheduler to admit waiting requests
             self.scheduler.notify_departure(request.request_id)
-            self._admit_waiting_requests()
+            return True
         else:
             self._schedule_next_departure(request)
+            return False
 
+    # check if the request can be enqueued to the scheduler, if yes, mark it as running and schedule its next departure
     def _admit_waiting_requests(self) -> None:
         for request in self.scheduler.schedule(self.current_time):
             request.mark_running(current_time=self.current_time)

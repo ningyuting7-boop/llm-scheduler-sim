@@ -9,5 +9,5 @@ from src.scheduler import Scheduler
 
 
 class FCFSScheduler(Scheduler):
-    def _priority_key(self, request: Request) -> Tuple[float, int]:
+    def _priority_key(self, request: Request, current_time: float) -> Tuple[float, int]:
         return (request.arrival_time, request.request_id)
