@@ -29,6 +29,12 @@ class Request:
     expected_length: Optional[float] = None
     tail_risk: Optional[float] = None
 
+    # Set by workload.generate_contaminated_workload; True for the
+    # deliberately-constructed severe-underestimation category (see
+    # docs/Week2_3_Plan.md section 11). Not used by any scheduler --
+    # purely for post-hoc analysis (e.g. collateral-damage breakdown).
+    is_tail: bool = False
+
     status: RequestStatus = field(default=RequestStatus.WAITING, compare=False)
     remaining_len: int = field(init=False, compare=False)
     start_time: Optional[float] = field(default=None, compare=False)

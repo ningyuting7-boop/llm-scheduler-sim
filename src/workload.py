@@ -210,5 +210,6 @@ def generate_contaminated_workload(
         request.predicted_output_len = predicted_length
         request.expected_length = lognormal_expectation(mu, sigma)
         request.tail_risk = lognormal_cvar(mu, sigma, alpha=cvar_alpha)
+        request.is_tail = is_tail
         requests.append(request)
     return requests
