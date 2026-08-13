@@ -1,4 +1,4 @@
-"""Exp1: overall performance of all four schedulers, on the real LMSYS
+"""Exp1: overall performance of all three schedulers, on the real LMSYS
 workload, across three load levels. See docs/Week2_3_Plan.md section 5.2.
 
 Feeds Figure 2 (avg response vs RPS), Figure 3 (p95 response vs RPS), and
@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from experiments.run_experiment import run_once
 
-SCHEDULERS = ["fcfs", "oracle_sjf", "predicted_sjf", "arrs"]
+SCHEDULERS = ["fcfs", "oracle_sjf", "predicted_sjf"]
 LOAD_LEVELS = [2.0, 5.0, 10.0]  # requests/sec (Poisson lambda)
 
 DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exp1_overall_performance.csv")
@@ -28,8 +28,6 @@ def main() -> None:
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--decode-time-per-step", type=float, default=0.05)
     parser.add_argument("--k", type=float, default=1.0, help="predictor quality tier, see src/predictor.py QUALITY_TIERS (1.0=realistic)")
-    parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=str, default=DEFAULT_OUT)
     args = parser.parse_args()
@@ -43,8 +41,6 @@ def main() -> None:
                 num_requests=args.num_requests,
                 arrival_rate=rps,
                 k=args.k,
-                alpha=args.alpha,
-                beta=args.beta,
                 max_batch_size=args.max_batch_size,
                 decode_time_per_step=args.decode_time_per_step,
                 seed=args.seed,

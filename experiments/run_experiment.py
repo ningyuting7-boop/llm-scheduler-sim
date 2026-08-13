@@ -20,7 +20,6 @@ from src.metrics import MetricsSummary, compute_summary, print_summary, write_cs
 from src.predictor import predict_length
 from src.request import Request
 from src.scheduler import Scheduler
-from src.schedulers.arrs import ARRSScheduler
 from src.schedulers.fcfs import FCFSScheduler
 from src.schedulers.oracle_sjf import OracleSJFScheduler
 from src.schedulers.predicted_sjf import PredictedSJFScheduler
@@ -36,7 +35,7 @@ DEFAULT_LMSYS_CSV = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath
 
 # Schedulers that rank by predicted_output_len need predict_length run over
 # the workload first; fcfs/oracle_sjf never look at that field.
-SCHEDULERS_NEEDING_PREDICTION = {"predicted_sjf", "arrs"}
+SCHEDULERS_NEEDING_PREDICTION = {"predicted_sjf"}
 
 
 def _build_workload(
@@ -59,15 +58,13 @@ def _build_workload(
     raise ValueError(f"Unknown workload_source: {workload_source!r}")
 
 
-def _build_scheduler(scheduler_name: str, max_batch_size: int, alpha: float, beta: float, decode_time_per_step: float) -> Scheduler:
+def _build_scheduler(scheduler_name: str, max_batch_size: int) -> Scheduler:
     if scheduler_name == "fcfs":
         return FCFSScheduler(max_batch_size)
     if scheduler_name == "oracle_sjf":
         return OracleSJFScheduler(max_batch_size)
     if scheduler_name == "predicted_sjf":
         return PredictedSJFScheduler(max_batch_size)
-    if scheduler_name == "arrs":
-        return ARRSScheduler(max_batch_size, alpha=alpha, beta=beta, decode_time_per_step=decode_time_per_step)
     raise ValueError(f"Unknown scheduler_name: {scheduler_name!r}")
 
 
@@ -80,8 +77,6 @@ def run_once(
     lmsys_csv: str = DEFAULT_LMSYS_CSV,
     long_request_ratio: float = 0.05,
     k: float = 0.0,
-    alpha: float = 1.0,
-    beta: float = 0.0,
     max_batch_size: int = 8,
     decode_time_per_step: float = 0.05,
     seed: Optional[int] = None,
@@ -102,7 +97,7 @@ def run_once(
             request.predicted_output_len = predicted
             request.prediction_uncertainty = uncertainty
 
-    scheduler = _build_scheduler(scheduler_name, max_batch_size, alpha, beta, decode_time_per_step)
+    scheduler = _build_scheduler(scheduler_name, max_batch_size)
     Simulator(requests, scheduler=scheduler, decode_time_per_step=decode_time_per_step).run()
 
     return requests, compute_summary(requests)
@@ -110,7 +105,7 @@ def run_once(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run one scheduling experiment and report metrics.")
-    parser.add_argument("--scheduler", required=True, choices=["fcfs", "oracle_sjf", "predicted_sjf", "arrs"])
+    parser.add_argument("--scheduler", required=True, choices=["fcfs", "oracle_sjf", "predicted_sjf"])
     parser.add_argument("--workload-source", default="lognormal", choices=["lognormal", "lmsys", "bimodal"])
     parser.add_argument("--num-requests", type=int, default=200)
     parser.add_argument("--arrival-rate", type=float, default=2.0)
@@ -118,8 +113,6 @@ def main() -> None:
     parser.add_argument("--lmsys-csv", type=str, default=DEFAULT_LMSYS_CSV)
     parser.add_argument("--long-request-ratio", type=float, default=0.05)
     parser.add_argument("--k", type=float, default=0.0, help="predictor quality tier, see src/predictor.py QUALITY_TIERS")
-    parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--decode-time-per-step", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
@@ -135,8 +128,6 @@ def main() -> None:
         lmsys_csv=args.lmsys_csv,
         long_request_ratio=args.long_request_ratio,
         k=args.k,
-        alpha=args.alpha,
-        beta=args.beta,
         max_batch_size=args.max_batch_size,
         decode_time_per_step=args.decode_time_per_step,
         seed=args.seed,

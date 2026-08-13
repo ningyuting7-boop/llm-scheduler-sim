@@ -42,7 +42,7 @@ class Scheduler(ABC):
     def _priority_key(self, request: Request, current_time: float) -> Any:
         """Sort key used to pick the next waiting request to admit (smaller = sooner).
 
-        current_time is needed by aging-based policies (e.g. ARRS), which
-        rank requests partly by how long they've been waiting.
+        current_time is needed by aging-based policies, which rank requests
+        partly by how long they've been waiting.
         """
         raise NotImplementedError

@@ -22,7 +22,12 @@ class Request:
     # Reserved for later scheduling algorithms; unused during the FCFS stage
     priority: int = 0
     predicted_output_len: Optional[float] = None
-    prediction_uncertainty: Optional[float] = None  # ARRS only; None treated as 0
+    prediction_uncertainty: Optional[float] = None  # None treated as 0
+
+    # TIEScheduler only (log-normal + CVaR model, see src/predictor.py):
+    # E[X] and CVaR_alpha[X] of the fitted per-request distribution.
+    expected_length: Optional[float] = None
+    tail_risk: Optional[float] = None
 
     status: RequestStatus = field(default=RequestStatus.WAITING, compare=False)
     remaining_len: int = field(init=False, compare=False)

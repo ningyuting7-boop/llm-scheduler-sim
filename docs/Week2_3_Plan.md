@@ -1,5 +1,7 @@
 # Week 2–3 详细计划：ARRS Scheduler + LMSYS 数据接入 + 实验框架
 
+> **[更新] ARRS 已从代码库中移除，不再使用。** 下文 Phase 2/3.3、Phase 4 的 exp2/exp4、第九节整段记录的是 ARRS 从设计到被放弃的完整过程，作为决策历史保留，但对应的 `src/schedulers/arrs.py`、`exp2_prediction_robustness.py`、`exp4_starvation.py`、`plot_skew_ablation.py`、`plot_skew_at_k7.py` 等文件已删除。ARRS 想解决的问题（tail-risk-aware 调度）由第十一节的 **TIEScheduler** 取代，见该节。
+
 本文档只做设计，不含最终实现代码。所有函数签名/类结构都是"契约"（接口 + 关键行为约定），具体实现留给写代码的时候。目标是让两个人可以照着这份文档并行开工，不用互相对齐接口。
 
 沿用 Week 1 的原则：**先改动最小的公共基础设施，再加算法，再接数据，最后才是实验脚本和画图**——顺序反了会导致后面的人一边写实验一边发现底层框架要改。
@@ -627,3 +629,104 @@ predicted_B, unc_B = predict_length(150, QUALITY_TIERS["high"], rng)  # 请求 B
 **ARRS**：`191.23 > 189.64` → 选 **B**。ARRS 因为看到 A 的 `uncertainty=167.69` 特别大（远超 B 的 43.89），加大了对 A 的风险惩罚，即使 A 的预测值本身看起来更短，ARRS 依然判断"这个预测不可信，先让 B 上"——这正是 `beta` 现在真正在起作用的证据（换算前的旧版本里，这一步不会发生,因为 uncertainty 对 A、B 是同一个数）。
 
 这个例子任何人在自己电脑上用同一个 seed 都能重新跑出同样的数字，不是手算编出来的案例。
+
+---
+
+## 十一、TIEScheduler：log-normal + CVaR，正式验证"tail-awareness 能不能帮上平均延迟"
+
+背景：第十节的对称 `uncertainty` 模型，数学上证明过 `beta×uncertainty` 帮不上平均延迟（`E[真实值|predicted,σ]` 跟 `σ` 无关）。尝试过的两个修补方案——人为加 `skew`（有效但没有真实数据支撑）、换成 log 空间对称噪声（数学论证是错的，实测反而更差）——都不理想。这一节是第三次尝试，也是第一次得到**干净、单调、没有 cherry-pick** 的正面结果。
+
+### 11.1 跟第十节的关键区别：不再用一个标量 σ，而是拟合一条分布
+
+第十节：每个请求只有 `(predicted_output_len, uncertainty)` 两个数,`uncertainty` 是"这个区间有多宽"，不携带方向信息。
+
+第十一节：每个请求拟合一条 **log-normal 分布**（`X ~ LogNormal(μ, σ)`，`μ=log(L_pred)`），然后算这条分布的 **`E[X]`**（期望）和 **`CVaR_90[X]`**（最差 10% 情况下的条件期望）。log-normal 天生右偏（长尾在上不在下），所以 `CVaR_90` 天然比 `E[X]` 大得多——这个不对称性是分布形状带来的，不需要像 `skew` 那样额外声明一个方向性假设。
+
+**为什么用 log-normal 不用论文（TIE, Zheng et al. 2026）的 log-t**：log-t 的 `E[X]`/`CVaR` 没有闭式解，论文里是用蒙特卡洛（1万样本/请求）算的，我们的模拟器要给几千个请求都算一遍，用蒙特卡洛太慢。log-normal 是 TIE 论文自己 Table 1 里报告的**第二拟合优度分布**（KS 通过率 60.3%，比 log-t 的 93.1% 差一些，但仍然过关），换来的好处是 `E[X]` 和 `CVaR_α[X]` 都有闭式公式：
+
+```
+E[X] = exp(μ + σ²/2)
+CVaR_α[X] = E[X] × Φ(σ − Φ⁻¹(α)) / (1−α)      Φ = 标准正态 CDF
+```
+
+这两个公式已经用 200 万次蒙特卡洛采样验证过，跟闭式解精确匹配（见 `src/predictor.py` `lognormal_expectation`/`lognormal_cvar`）。
+
+### 11.2 每个请求的 `(predicted, σ)` 怎么来——两档，分开标注出处
+
+**95%-99% 的"正常"请求**：`predicted = true + ε`，`ε` 从一个 **95/5 的 Gaussian mixture** 里抽——不是单个 Gaussian，因为 ELIS 论文（Choi et al. 2025, Table 2, fine-tuned BGE）报的 `MAE=71.48` 和 `RMSE=101.29` 算出来的比值是 `101.29/71.48≈1.417`，而单个 Gaussian 的 MAE/RMSE 比值锁定在 `≈1.253`（RMSE 和 MAE 对 Gaussian 来说不是独立的两个自由度），匹配不上真实数据,说明真实误差比 Gaussian 更重尾。用 `scipy.optimize.fsolve` 解两个方程（`0.95σ1√(2/π)+0.05σ2√(2/π)=MAE`，`√(0.95σ1²+0.05σ2²)=RMSE`），解出 `σ1=78.77, σ2=295.52`——**这两个数字精确复现了 ELIS 的真实 MAE 和 RMSE**，不是凑的。`σ_normal=0.2`（log-normal 的 σ 参数,跟 log-t 论文里的量级同一个数量级)。
+
+**1%-5% 的"tail"请求**：这个**没有 ELIS 或任何论文支撑，是我们明确构造出来的压力测试场景**——真实长度从整个真实分布的 **P99 以上** 抽（真实很长的请求），预测长度从 **P50 以下** 独立抽（看起来很短），两者故意不相关，制造"预测器严重低估"的场景。`σ_tail=0.8`（比 `σ_normal` 大很多，代表"这个预测的置信区间应该报得很宽"——这是我们的建模假设：**严重低估的场景往往对应预测器自己也该，但没有，报出高不确定性**，报告里要明确写成"合理的仿真假设"，不是"真实 predictor 的行为"）。
+
+### 11.3 两个 Scheduler 怎么用这些数字
+
+```python
+# Predicted SJF：只看点估计，不看分布
+score = predicted_output_len
+
+# TIEScheduler（新增，src/schedulers/tie.py）：用整条分布
+score = expected_length + beta * tail_risk      # E[X] + β·CVaR_90[X]
+```
+
+`TIEScheduler` 没有 aging 项——故意的，这一节只想单独验证"tail-awareness 本身能不能帮上平均延迟"，跟 aging/starvation（已经在 Exp4 验证过）分开，不要混在一起讲。
+
+### 11.4 Experiment A / B 的结果（已跑完，5 个 seed 平均）
+
+**Experiment A**（固定 `σ_tail=0.8`，扫 `tail_rate` 从 0% 到 5%）：
+
+| tail_rate | Predicted SJF | TIE | 优势 |
+|---|---|---|---|
+| 0% | 295.52 | 295.52 | 0.00 |
+| 1% | 326.06 | 323.66 | 2.40 |
+| 2% | 362.90 | 358.27 | 4.63 |
+| 3% | 410.43 | 400.94 | 9.49 |
+| 4% | 457.91 | 441.35 | 16.56 |
+| 5% | 497.01 | 476.52 | **20.49** |
+
+![Figure A](figures/figA_tail_rate.png)
+
+**Experiment B**（固定 `tail_rate=3%`，扫 `σ_tail` 从 0.2 到 1.0）：
+
+| σ_tail | Predicted SJF | TIE | 优势 |
+|---|---|---|---|
+| 0.2 | 410.43 | 410.43 | 0.00 |
+| 0.4 | 410.43 | 408.93 | 1.50 |
+| 0.6 | 410.43 | 405.92 | 4.51 |
+| 0.8 | 410.43 | 400.94 | 9.49 |
+| 1.0 | 410.43 | 393.06 | **17.37** |
+
+![Figure B](figures/figB_sigma_tail.png)
+
+**两组都是单调、干净的结果，没有 cherry-pick**：`tail_rate=0`（没有污染）时两者完全相等（0.00），符合预期；优势随污染比例、随 σ_tail 都单调递增。Predicted SJF 在 Experiment B 里是一条水平线——符合预期，因为 `σ_tail` 只影响 TIE 怎么算分布,不影响 `predicted_output_len` 本身。
+
+### 11.4.1 "表现不好"具体表现在哪——不是 tail 请求自己，是它连累的其他请求
+
+拆开看 `tail_rate=3%` 这组数据（59个左右的 tail 请求 vs 剩下 1941 个正常请求，5 个 seed 平均）：
+
+| | tail 请求自己的平均 response_time | 其他正常请求的平均 response_time |
+|---|---|---|
+| Predicted SJF | 69.8（很快，因为"看起来短"被插队优先跑） | **420.7**（被拖累） |
+| TIE | 130.3（变慢，被正确地往后排） | **409.1**（净改善） |
+
+![Figure: collateral damage](figures/fig_collateral_damage.png)
+
+**这是 HOL blocking 的具体机制**：Predicted SJF 让被严重低估的长请求自己插队跑得很快,但它占用 batch 槽位的时间是按真实长度算的,这段时间把后面的正常请求都耽误了。TIE 因为看到这些请求的 `CVaR_90` 很高,故意让它们自己等更久,用它们自己的响应时间换来了大多数（97%）正常请求的净改善——这比只看整体平均数直观得多,能直接回答"预测器犯错的代价，最终是谁在承担"这个问题。
+
+### 11.5 跟老师汇报时要讲清楚的边界
+
+1. **"正常"档（95-99%）是有真实数据支撑的**（ELIS 的 MAE/RMSE），"tail"档（1-5%）**是我们明确构造的压力测试场景**，两者不能混着说成"都是真实的"
+2. `tail_rate`、`σ_tail`、`σ_normal` 都是可以在报告里公开讨论的实验参数,不是"调出来凑数据"——两组敏感性实验（A、B）本身就是用来说明"这个结论在参数变化下是稳健的，不是撞对了一个特定数字才成立"
+3. `TIEScheduler` 目前没有 aging 项——它只回答"tail-awareness 能不能帮上平均延迟"这一个问题，跟"aging 能不能防止 starvation"是两个不同的问题（后者是第九节 `ARRSScheduler` 想回答的，`ARRSScheduler` 已从代码库移除，见文档开头的更新说明），报告里建议分两节讲，不要合并成一个故事
+
+## 十二、`decode_time_per_step` 的出处
+
+所有实验脚本（`run_experiment.py`/`exp1`/`exp3`/`expA`/`expB`/`plot_four_schedulers_*`）用的 `decode_time_per_step=0.05`，含义是"仿真时间单位 = 秒"时，生成一个 token 要 **50ms**（即 20 tokens/秒的生成速度）。
+
+**出处**：50ms/token 的量级参考自公开 LLM serving benchmark（vLLM、TensorRT-LLM、Anyscale LLMPerf 这类工具测出的 inter-token latency，ITL）里中等规模模型、有批处理场景下的典型范围：
+
+- 7B 级别模型，单张 A100/H100：约 15~30ms/token
+- 13B~34B 级别：约 30~60ms/token
+- 70B 级别：约 50~100ms/token（取决于并行策略）
+
+50ms/token 落在 13B~34B 这个区间，是一个有量级依据但**没有绑定到某一篇具体论文/某一次具体测试**的假设值，跟 `REFERENCE_SCALE` 这种直接引用 ELIS Table 2 数字的常数不是同一个可信度级别——如果要更精确，需要指定一个具体要对齐的模型规模/硬件，再换算成精确数字。
+
+**为什么必须是"秒"这个单位、不能随便换**：`arrival_rate`（Poisson λ，单位 requests/秒）和 `throughput`（`src/metrics.py` 里算的 requests/秒）都是按"秒"定义的。只要 `decode_time_per_step` 也用秒做单位，`waiting_time`/`response_time`/`throughput` 就能在同一套时间轴上直接读数、互相换算，不需要额外的单位转换——这也是为什么这个值不能脱离"仿真时间=秒"这个约定单独调整。

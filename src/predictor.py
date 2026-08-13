@@ -1,5 +1,5 @@
 """Prediction-error injection shared by every experiment that needs a
-predicted (rather than ground-truth) output length: Predicted SJF and ARRS.
+predicted (rather than ground-truth) output length: Predicted SJF.
 
 Every constant here is traceable to a source -- see docs/Week2_3_Plan.md
 section 9.7 for the full derivation and a worked numeric example. Summary:
@@ -24,9 +24,8 @@ never exceed sigma in magnitude (a Gaussian tail could, rarely, exceed it).
 
 `sigma` (and therefore `uncertainty`) varies PER REQUEST via an independent
 draw `u ~ Uniform(0, 1)`, deliberately uncorrelated with true_length or any
-other property of the request -- this is what makes ARRS's `beta * uncertainty`
-term actually discriminate between requests (a constant uncertainty for every
-request cancels out of every score comparison and does nothing).
+other property of the request -- a constant uncertainty for every request
+would cancel out of any score comparison that weights it and do nothing.
 """
 
 from __future__ import annotations
@@ -34,6 +33,8 @@ from __future__ import annotations
 import math
 import random
 from typing import Tuple
+
+from scipy.stats import norm
 
 MIN_PREDICTED_LENGTH = 1.0
 
@@ -91,58 +92,46 @@ def predict_length(true_length: int, k: float, rng: random.Random, skew: float =
 
 
 # Mean real LMSYS output length (words), from data/lmsys_output_lengths.csv.
-# Used only to convert ELIS's absolute RMSE into a relative (log-space) error
-# scale below -- an approximation (treating relative RMSE as a lognormal
-# coefficient-of-variation proxy), not an exact statistic from any paper.
-_MEAN_TRUE_LENGTH = 119.52
-
-# relative_rmse = REFERENCE_SCALE / mean(true_length) = 76 / 119.52 ~= 0.636.
-# For a lognormal-ish variable, CV = sqrt(exp(s^2) - 1); solving for s given
-# CV = relative_rmse gives the log-space sigma at k=1 ("realistic").
-_RELATIVE_RMSE = REFERENCE_SCALE / _MEAN_TRUE_LENGTH
-REFERENCE_SCALE_LOG = math.sqrt(math.log(1.0 + _RELATIVE_RMSE ** 2))
 
 
-def predict_length_lognormal(true_length: int, k: float, rng: random.Random) -> Tuple[float, float]:
-    """Alternative to predict_length: noise is symmetric in LOG space, not
-    in raw word-count space.
+# ---------------------------------------------------------------------------
+# Log-normal + CVaR model (approximates TIE's log-t + CVaR; see
+# docs/Week2_3_Plan.md section 11 for the full derivation). Log-normal is
+# TIE's own second-best-fitting family (Table 1: 60.3% KS pass rate vs
+# log-t's 93.1%), chosen here because E[X] and CVaR_alpha[X] have closed
+# forms -- no Monte Carlo / numerical integration needed, unlike log-t.
+# ---------------------------------------------------------------------------
 
-    u ~ Uniform(0, 1)
-    sigma_log = u * k * REFERENCE_SCALE_LOG
-    eps ~ Uniform(-sigma_log, sigma_log)        -- symmetric in log space
-    predicted_length = clip(true_length * exp(eps), MIN_PREDICTED_LENGTH, L_MAX)
+# Calibrated so a 95/5 Gaussian mixture N(0,SIGMA1^2)/N(0,SIGMA2^2) jointly
+# matches Choi et al. 2025 ("ELIS") Table 2's fine-tuned-BGE numbers:
+# MAE=71.48, RMSE=101.29 (both real, not independently chosen -- a plain
+# Gaussian can't match both at once, since Gaussian forces RMSE/MAE~=1.253,
+# but ELIS's ratio is 101.29/71.48~=1.417, i.e. heavier-tailed than Gaussian).
+# Solved via scipy.optimize.fsolve; see the two equations in the module
+# docstring history / conversation notes.
+_MIXTURE_WEIGHT_MAIN = 0.95
+_MIXTURE_SIGMA_MAIN = 78.77
+_MIXTURE_SIGMA_TAIL = 295.52
 
-    Two things fall out of this for free, without any hand-picked skew
-    parameter:
 
-    1. It avoids the multiplicative model's earlier saturation problem
-       (see module docstring history / docs/Week2_3_Plan.md section 9.2):
-       comparing predicted_i vs predicted_j reduces to comparing
-       log(true_i)+eps_i vs log(true_j)+eps_j -- an ADDITIVE relationship in
-       log space, so growing sigma_log keeps adding disorder to the ranking
-       instead of canceling out.
-    2. Because exp() is convex, E[true_length | predicted_length, sigma_log]
-       = predicted_length * sinh(sigma_log)/sigma_log > predicted_length,
-       and grows with sigma_log (Jensen's inequality) -- i.e. the higher the
-       uncertainty, the more the true length is expected to exceed the
-       predicted one, *purely from the log transform*, with no separate
-       "skew toward underestimation" assumption bolted on. This is the same
-       structural property that makes CVaR meaningful in Zheng et al. 2026
-       ("TIE", arXiv:2604.00499): a length distribution that's bounded below
-       and unbounded above is inherently right-skewed, which is also true of
-       our own LMSYS data (measured skewness = 2.945, see data/lmsys_output_lengths.csv).
+def sample_calibrated_error(rng: random.Random) -> float:
+    """eps for a "normal" (non-contaminated) request: a 95/5 Gaussian
+    mixture jointly calibrated to ELIS's real MAE and RMSE (see constants
+    above), not a single Gaussian (which can't match both simultaneously)."""
+    if rng.random() < _MIXTURE_WEIGHT_MAIN:
+        return rng.gauss(0.0, _MIXTURE_SIGMA_MAIN)
+    return rng.gauss(0.0, _MIXTURE_SIGMA_TAIL)
 
-    `uncertainty` is reported in the same absolute (words) units as
-    predicted_length -- the exact expected gap E[true - predicted | ...]
-    implied by the model above -- so it plugs into ARRS's existing
-    `predicted + beta * uncertainty` score without rescaling beta.
-    """
-    u = rng.uniform(0.0, 1.0)
-    sigma_log = u * k * REFERENCE_SCALE_LOG
-    eps = rng.uniform(-sigma_log, sigma_log)
-    predicted_length = true_length * math.exp(eps)
-    predicted_length = min(L_MAX, max(MIN_PREDICTED_LENGTH, predicted_length))
 
-    expected_ratio = (math.sinh(sigma_log) / sigma_log) if sigma_log > 0 else 1.0
-    uncertainty = predicted_length * (expected_ratio - 1.0)
-    return predicted_length, uncertainty
+def lognormal_expectation(mu: float, sigma: float) -> float:
+    """E[X] for X ~ LogNormal(mu, sigma)."""
+    return math.exp(mu + sigma * sigma / 2.0)
+
+
+def lognormal_cvar(mu: float, sigma: float, alpha: float = 0.9) -> float:
+    """CVaR_alpha[X] = E[X | X >= VaR_alpha(X)] for X ~ LogNormal(mu, sigma).
+    Closed form: E[X] * Phi(sigma - Phi^-1(alpha)) / (1 - alpha). Verified
+    against Monte Carlo (2M samples) to match to within simulation noise."""
+    expectation = lognormal_expectation(mu, sigma)
+    z = norm.ppf(alpha)
+    return expectation * norm.cdf(sigma - z) / (1.0 - alpha)

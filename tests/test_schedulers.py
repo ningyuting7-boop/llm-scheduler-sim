@@ -1,4 +1,4 @@
-"""Regression tests for Oracle SJF, Predicted SJF, and ARRS.
+"""Regression tests for Oracle SJF and Predicted SJF.
 
 Numbers here are hand-verified (see docs/Week2_3_Plan.md section 7), not
 just "assert it runs" checks, so a bug in the ordering logic can't hide
@@ -14,7 +14,6 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.request import Request
-from src.schedulers.arrs import ARRSScheduler
 from src.schedulers.fcfs import FCFSScheduler
 from src.schedulers.oracle_sjf import OracleSJFScheduler
 from src.schedulers.predicted_sjf import PredictedSJFScheduler
@@ -82,13 +81,11 @@ class TestPredictedSJF(unittest.TestCase):
             Simulator(requests, scheduler=PredictedSJFScheduler(max_batch_size=1), decode_time_per_step=1.0).run()
 
 
-class TestARRSStarvationPrevention(unittest.TestCase):
+class TestPredictedSJFStarvation(unittest.TestCase):
     """A long request competes against a continuous, overloading stream of
     short requests (arrival rate >> service rate, so the queue never
     drains). Under Predicted SJF the long request's score never improves,
-    so it only runs once the short stream is fully exhausted. Under ARRS
-    the aging term lets it win once it has waited long enough, bounding its
-    wait well below that.
+    so it only runs once the short stream is fully exhausted.
     """
 
     NUM_SHORT_REQUESTS = 400
@@ -120,17 +117,6 @@ class TestARRSStarvationPrevention(unittest.TestCase):
         # It only ever gets admitted after every short request has, i.e. its
         # wait equals the full short-request count.
         self.assertEqual(long_request.waiting_time, float(self.NUM_SHORT_REQUESTS))
-
-    def test_arrs_bounds_the_long_requests_wait(self):
-        requests = self._make_requests()
-        Simulator(
-            requests,
-            scheduler=ARRSScheduler(max_batch_size=1, alpha=2.0, beta=0.0, decode_time_per_step=1.0),
-            decode_time_per_step=1.0,
-        ).run()
-        long_request = requests[0]
-        # Aging lets it win well before the short stream is exhausted.
-        self.assertLess(long_request.waiting_time, self.NUM_SHORT_REQUESTS / 2)
 
 
 if __name__ == "__main__":
