@@ -37,11 +37,16 @@ MODEL_NAME = "Qwen/Qwen3-8B"
 SAMPLES_PER_PROMPT = 20  # paper: 20 repeated generations per prompt
 # Mirrors ua_predictor.py's MAX_GENERATED_TOKENS / CVAR_MAX_GENERATED_TOKENS.
 MAX_GENERATED_TOKENS = 2048
-# Assumption (undocumented in the paper/repo): standard stochastic sampling,
-# not greedy -- output length varies because *when* EOS gets sampled is
-# genuinely random, and a low temperature would collapse that variance and
-# make the log-t fit degenerate. See docs/VLLM_Qwen3_Reproduction_Plan.md.
-SAMPLING_TEMPERATURE = 1.0
+# Neither the TIE paper nor its repo specifies decoding parameters for the
+# labeling step. Rather than pick an arbitrary temperature, we use Qwen3's
+# own model-card-recommended settings for non-thinking mode -- these
+# fitted (mu, sigma) values are conditional on whatever decoding config
+# produced them, so it must match whatever config Phase 3's benchmark
+# actually serves requests with (see docs/VLLM_Qwen3_Reproduction_Plan.md).
+SAMPLING_TEMPERATURE = 0.7
+SAMPLING_TOP_P = 0.8
+SAMPLING_TOP_K = 20
+SAMPLING_MIN_P = 0.0
 
 
 def stream_first_turn_prompts(num_prompts: int) -> Iterator[str]:
@@ -88,6 +93,9 @@ def generate_completion_lengths(
     sampling_params = SamplingParams(
         n=samples_per_prompt,
         temperature=SAMPLING_TEMPERATURE,
+        top_p=SAMPLING_TOP_P,
+        top_k=SAMPLING_TOP_K,
+        min_p=SAMPLING_MIN_P,
         max_tokens=MAX_GENERATED_TOKENS,
     )
     conversations = [[{"role": "user", "content": prompt}] for prompt in prompts]
