@@ -8,6 +8,7 @@ before spending HPC time on the real labeling pipeline.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import unittest
@@ -50,6 +51,18 @@ class TestFitLogT(unittest.TestCase):
 
         self.assertAlmostEqual(fit.mu, true_mu, delta=0.5)
         self.assertGreater(fit.sigma, 0.0)
+
+    def test_handles_all_identical_samples_without_optimizer(self) -> None:
+        # Regression test: this happened for real in Phase 1 pilot data
+        # when several prompts' completions all hit the max_tokens cap.
+        # The optimizer must not be trusted here (see _DEGENERATE_SIGMA_FLOOR
+        # comment) -- check we get a small positive sigma, not an arbitrary
+        # unconverged value.
+        fit = fit_logt([2048, 2048, 2048])
+
+        self.assertAlmostEqual(fit.mu, math.log(2048), places=9)
+        self.assertGreater(fit.sigma, 0.0)
+        self.assertLess(fit.sigma, 0.5)
 
     def test_rejects_non_positive_samples(self) -> None:
         with self.assertRaises(ValueError):

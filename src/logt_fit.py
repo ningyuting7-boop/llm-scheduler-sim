@@ -17,6 +17,15 @@ from scipy import optimize, stats
 
 DEFAULT_NU = 3.5
 
+# Used only when every sample is numerically identical (zero variance in
+# log-space, e.g. every completion happened to hit the same token cap).
+# The true MLE in that degenerate case pushes sigma -> 0 (an unbounded,
+# ever-decreasing objective in log_sigma -- see fit_logt), which L-BFGS-B
+# can't be trusted to find correctly since there's no local curvature to
+# search with. Returning a small floor instead of running the optimizer
+# avoids silently reporting an arbitrary, unconverged value.
+_DEGENERATE_SIGMA_FLOOR = 0.05
+
 
 @dataclass
 class LogTFit:
@@ -52,8 +61,11 @@ def fit_logt(samples: Sequence[float], nu: float = DEFAULT_NU) -> LogTFit:
 
     log_samples = np.log(samples_arr)
     mu0 = float(np.mean(log_samples))
-    sigma0 = float(np.std(log_samples)) or 1.0
-    x0 = np.array([mu0, math.log(sigma0)])
+    sample_std = float(np.std(log_samples))
+    if sample_std == 0.0:
+        return LogTFit(mu=mu0, sigma=_DEGENERATE_SIGMA_FLOOR, nu=nu, log_likelihood=float("nan"))
+
+    x0 = np.array([mu0, math.log(sample_std)])
 
     result = optimize.minimize(
         _neg_log_likelihood,

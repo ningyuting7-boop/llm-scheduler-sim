@@ -69,6 +69,16 @@ def generate_completion_lengths(
 ) -> List[List[int]]:
     """Batch-generate `samples_per_prompt` completions per prompt via vLLM.
 
+    Uses llm.chat() (not llm.generate()) so Qwen3-8B's chat template is
+    applied -- feeding it raw prompt text as a bare continuation makes an
+    instruction-tuned model behave unpredictably. `enable_thinking=False`
+    turns off Qwen3's reasoning/"thinking" mode: we're modeling ordinary
+    chat-assistant response lengths (comparable to LMSYS-Chat-1M), not
+    reasoning-trace lengths, and leaving thinking mode on produced
+    completions that almost all ran to the max_tokens cap instead of
+    reflecting a real response-length distribution (see
+    docs/VLLM_Qwen3_Reproduction_Plan.md Phase 1 notes).
+
     Returns one list of output-token-counts per prompt, in the same order
     as `prompts`.
     """
@@ -80,7 +90,12 @@ def generate_completion_lengths(
         temperature=SAMPLING_TEMPERATURE,
         max_tokens=MAX_GENERATED_TOKENS,
     )
-    outputs = llm.generate(prompts, sampling_params)
+    conversations = [[{"role": "user", "content": prompt}] for prompt in prompts]
+    outputs = llm.chat(
+        conversations,
+        sampling_params,
+        chat_template_kwargs={"enable_thinking": False},
+    )
 
     lengths_per_prompt: List[List[int]] = []
     for output in outputs:
