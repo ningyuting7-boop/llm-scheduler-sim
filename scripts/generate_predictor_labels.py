@@ -22,7 +22,10 @@ import csv
 import itertools
 import json
 import os
+import sys
 from typing import Iterator, List
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.logt_fit import DEFAULT_NU, fit_logt
 
