@@ -49,9 +49,16 @@ SAMPLING_TOP_K = 20
 SAMPLING_MIN_P = 0.0
 
 
-def stream_first_turn_prompts(num_prompts: int) -> Iterator[str]:
-    """Yield the first turn's content from each of the first `num_prompts`
-    lmsys-chat-1m conversations, as a flat prompt string.
+def stream_first_turn_prompts(num_prompts: int, start_index: int = 0) -> Iterator[str]:
+    """Yield the first turn's content from `num_prompts` lmsys-chat-1m
+    conversations starting at `start_index`, as flat prompt strings.
+
+    `start_index` lets multiple jobs cover disjoint ranges of the dataset
+    in parallel (see hpc/generate_labels.slurm's job array) without
+    re-processing prompts an earlier run already covered -- streaming
+    still has to sequentially skip the first `start_index` records (no
+    random access), so this doesn't save read time, only avoids
+    redundant *generation* (the expensive part).
 
     Matches ua_predictor.py's extract_original_prompt(), which also just
     wants a flat prompt string -- multi-turn context is dropped, a
@@ -60,7 +67,7 @@ def stream_first_turn_prompts(num_prompts: int) -> Iterator[str]:
     from datasets import load_dataset
 
     ds = load_dataset("lmsys/lmsys-chat-1m", split="train", streaming=True)
-    for conversation in itertools.islice(ds, num_prompts):
+    for conversation in itertools.islice(ds, start_index, start_index + num_prompts):
         turns = conversation["conversation"]
         if not turns:
             continue
@@ -121,28 +128,32 @@ def write_labels_csv(prompts: List[str], fits, path: str) -> None:
             writer.writerow([prompt, fit.mu, fit.sigma])
 
 
-def write_samples_csv(prompts: List[str], lengths_per_prompt: List[List[int]], path: str) -> None:
+def write_samples_csv(
+    prompts: List[str], lengths_per_prompt: List[List[int]], path: str, start_index: int = 0
+) -> None:
     """Persist the raw per-prompt length samples separately, so a bug in
     the MLE fitting step never requires re-running the expensive
-    generation step."""
+    generation step. `prompt_id` is offset by `start_index` so IDs stay
+    globally unique across sharded runs (see hpc/generate_labels.slurm)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["prompt_id", "prompt", "sample_lengths"])
-        for prompt_id, (prompt, lengths) in enumerate(zip(prompts, lengths_per_prompt)):
-            writer.writerow([prompt_id, prompt, json.dumps(lengths)])
+        for offset, (prompt, lengths) in enumerate(zip(prompts, lengths_per_prompt)):
+            writer.writerow([start_index + offset, prompt, json.dumps(lengths)])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate TIE predictor training labels from Qwen3-8B.")
     parser.add_argument("--num-prompts", type=int, default=3000)
+    parser.add_argument("--start-index", type=int, default=0, help="skip this many lmsys-chat-1m records first")
     parser.add_argument("--samples-per-prompt", type=int, default=SAMPLES_PER_PROMPT)
     parser.add_argument("--labels-out", type=str, default=DEFAULT_LABELS_OUT)
     parser.add_argument("--samples-out", type=str, default=DEFAULT_SAMPLES_OUT)
     args = parser.parse_args()
 
-    print(f"Streaming {args.num_prompts} prompts from lmsys/lmsys-chat-1m ...")
-    prompts = list(stream_first_turn_prompts(args.num_prompts))
+    print(f"Streaming {args.num_prompts} prompts from lmsys/lmsys-chat-1m (start_index={args.start_index}) ...")
+    prompts = list(stream_first_turn_prompts(args.num_prompts, start_index=args.start_index))
     print(f"Got {len(prompts)} non-empty prompts.")
 
     print(f"Generating {args.samples_per_prompt} completions/prompt via {MODEL_NAME} ...")
@@ -152,7 +163,7 @@ def main() -> None:
     fits = [fit_logt(lengths) for lengths in lengths_per_prompt]
 
     write_labels_csv(prompts, fits, args.labels_out)
-    write_samples_csv(prompts, lengths_per_prompt, args.samples_out)
+    write_samples_csv(prompts, lengths_per_prompt, args.samples_out, start_index=args.start_index)
     print(f"Wrote {args.labels_out} and {args.samples_out}")
 
 
