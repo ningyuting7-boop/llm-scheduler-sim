@@ -40,6 +40,12 @@ mkdir -p logs results
 export HF_HOME=/scratch/ning.yuti/hf_cache
 export PYTHONPATH="$SLURM_SUBMIT_DIR:${PYTHONPATH:-}"
 
+# Clusters commonly set http_proxy for outbound access, and both curl and
+# aiohttp will route a request to 127.0.0.1 through it, which fails. Exempt
+# loopback for everything below, including `vllm bench serve`.
+export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
+
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
 PORT="${PORT:-8000}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
@@ -81,11 +87,26 @@ configure_arm() {
     esac
 }
 
+health_ok() {
+    # Python rather than curl: curl is not guaranteed present on a compute
+    # node, and a missing binary inside a silenced `if` is indistinguishable
+    # from a server that never came up.
+    python - "$PORT" <<'PY' 2>/dev/null
+import sys, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(f"http://127.0.0.1:{sys.argv[1]}/health", timeout=3) as r:
+        sys.exit(0 if r.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
 wait_for_server() {
     # vLLM takes minutes to load an 8B model and profile memory; poll rather
     # than guess a sleep.
     for _ in $(seq 1 180); do
-        if curl -sf "http://localhost:${PORT}/health" > /dev/null 2>&1; then
+        if health_ok; then
             return 0
         fi
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then

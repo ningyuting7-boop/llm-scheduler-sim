@@ -41,6 +41,28 @@ export TIE_MODEL_DIR="${TIE_MODEL_DIR:-checkpoints/predictor_full}"
 export TIE_SCORE_SEED="${TIE_SCORE_SEED:-0}"
 export TIE_PREDICTOR_GPU=0
 
+# Clusters commonly set http_proxy/https_proxy for outbound access, and both
+# curl and aiohttp will happily route a request to 127.0.0.1 through it,
+# which fails. Exempt loopback for everything downstream, including
+# `vllm bench serve`.
+export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
+export NO_PROXY="$no_proxy"
+
+# Health probe via Python rather than curl: curl is not guaranteed present on
+# a compute node, and a missing binary inside a silenced `if` would look
+# exactly like a server that never came up.
+health_ok() {
+    python - "$PORT" <<'PY' 2>/dev/null
+import sys, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(f"http://127.0.0.1:{sys.argv[1]}/health", timeout=3) as r:
+        sys.exit(0 if r.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
 unset TIE_BETA TIE_MODE TIE_ORACLE_CSV
 SCHED_ARGS=()
 case "$ARM" in
@@ -83,7 +105,7 @@ trap cleanup EXIT
 echo -n "waiting for server"
 UP=0
 for _ in $(seq 1 120); do
-    if curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then UP=1; break; fi
+    if health_ok; then UP=1; break; fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo ""
         echo "SERVER DIED DURING STARTUP. Last 60 lines:"
@@ -94,7 +116,29 @@ for _ in $(seq 1 120); do
     sleep 5
 done
 echo ""
-[[ $UP -eq 1 ]] || { echo "server never became healthy; tail of log:"; tail -60 "$LOG"; exit 1; }
+
+if [[ $UP -ne 1 ]]; then
+    echo "server never became healthy -- diagnosing:"
+    echo "  startup completed?  $(grep -c 'Application startup complete' "$LOG") match(es)"
+    echo "  proxy vars:         $(env | grep -i '^[a-z_]*proxy=' | tr '\n' ' ')"
+    echo "  listening sockets:"
+    (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep ":${PORT}" || echo "    nothing on port $PORT"
+    echo "  /health route registered?"
+    grep -E "Route: /health" "$LOG" || echo "    not in the route list"
+    echo "  raw probe:"
+    python - "$PORT" <<'PY'
+import sys, urllib.request
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+try:
+    with opener.open(f"http://127.0.0.1:{sys.argv[1]}/health", timeout=5) as r:
+        print("    status", r.status)
+except Exception as exc:
+    print("    failed:", type(exc).__name__, exc)
+PY
+    echo "  tail of server log:"
+    tail -30 "$LOG"
+    exit 1
+fi
 echo "server up (pid $SERVER_PID)"
 
 echo ""
