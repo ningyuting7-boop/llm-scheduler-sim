@@ -143,7 +143,9 @@ echo "server up (pid $SERVER_PID)"
 
 echo ""
 echo "--- predictor startup lines ---"
-grep -E "^\[TIE\]" "$LOG" | head -10 || echo "(none -- expected for the stock fcfs arm)"
+# Not anchored with ^: vLLM prefixes subprocess output with ANSI colour codes
+# and "(EngineCore_DP0 pid=NNN)", so our lines never start the line.
+grep -E "\[TIE\]" "$LOG" | head -10 || echo "(none -- expected for the stock fcfs arm)"
 
 echo ""
 echo "--- pushing $NUM_PROMPTS prompts at ${RATE}/s ---"
