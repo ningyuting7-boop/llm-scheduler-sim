@@ -47,7 +47,12 @@ export no_proxy="localhost,127.0.0.1,::1${no_proxy:+,$no_proxy}"
 export NO_PROXY="$no_proxy"
 
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
-PORT="${PORT:-8000}"
+# Job-specific port rather than a fixed 8000. A server orphaned by an earlier
+# job on the same node keeps 8000 bound, which makes every server this job
+# starts die instantly on bind -- and, worse, leaves the orphan answering the
+# health probe, so the job cheerfully benchmarks against a half-dead process
+# from a previous run.
+PORT="${PORT:-$((8000 + ${SLURM_JOB_ID:-0} % 1000))}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 GPU_UTIL="${GPU_UTIL:-0.88}"
 DATASET="${DATASET:-data/benchmark_prompts.jsonl}"
@@ -129,17 +134,33 @@ except Exception:
 PY
 }
 
+port_free() {
+    # Refuse to start on an occupied port. Without this the server dies on
+    # bind and the pre-existing listener answers the health probe in its
+    # place.
+    if health_ok; then return 1; fi
+    if (ss -ltn 2>/dev/null || netstat -ltn 2>/dev/null) | grep -q "[:.]${PORT}[[:space:]]"; then
+        return 1
+    fi
+    return 0
+}
+
 wait_for_server() {
     # vLLM takes minutes to load an 8B model and profile memory; poll rather
     # than guess a sleep.
+    #
+    # Liveness is checked BEFORE health, not after. The other order is what
+    # let a stale server from a previous job stand in for ours: it answered
+    # /health on the first poll, so the "did our own process die?" branch was
+    # never reached.
     for _ in $(seq 1 180); do
-        if health_ok; then
-            return 0
-        fi
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo "server died during startup -- see $SERVER_LOG" >&2
             tail -40 "$SERVER_LOG" >&2
             return 1
+        fi
+        if health_ok; then
+            return 0
         fi
         sleep 5
     done
@@ -162,8 +183,23 @@ stop_server() {
         wait "$SERVER_PID" 2>/dev/null || true
     fi
     unset SERVER_PID
+
+    # `vllm serve` runs its engine in a child process, so killing the CLI
+    # parent can orphan it still holding the port and the GPU. That is how a
+    # previous job left a listener behind that this one then benchmarked
+    # against by mistake; sweep our own strays rather than inflict them on
+    # whoever lands on this node next.
+    pkill -9 -u "$USER" -f "vllm serve .*--port ${PORT}" 2>/dev/null || true
+    sleep 2
 }
 trap stop_server EXIT
+
+if ! port_free; then
+    echo "FATAL: port $PORT on $(hostname) is already in use before we start." >&2
+    (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep "[:.]${PORT}" >&2
+    echo "Likely a server orphaned by an earlier job on this node." >&2
+    exit 1
+fi
 
 for ARM in $ARMS; do
     echo ""
@@ -200,6 +236,7 @@ for ARM in $ARMS; do
             --seed "$BENCH_SEED" \
             --percentile-metrics ttft,tpot,itl,e2el \
             --metric-percentiles 50,90,95,99 \
+            --ready-check-timeout-sec 60 \
             --save-result \
             --result-dir "$RESULT_DIR" \
             --result-filename "${ARM}_rate${RATE}.json" \

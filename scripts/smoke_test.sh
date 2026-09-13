@@ -30,7 +30,10 @@ NUM_PROMPTS="${2:-60}"
 RATE="${3:-32}"
 
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
-PORT="${PORT:-8000}"
+# Job-specific port rather than a fixed 8000: a server orphaned by an earlier
+# job on the same node keeps 8000 bound, and then answers the health probe in
+# place of ours.
+PORT="${PORT:-$((8000 + ${SLURM_JOB_ID:-0} % 1000))}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 GPU_UTIL="${GPU_UTIL:-0.88}"
 DATASET="${DATASET:-data/benchmark_prompts.jsonl}"
@@ -103,19 +106,27 @@ cleanup() {
         for _ in $(seq 1 20); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 2; done
         kill -9 "$SERVER_PID" 2>/dev/null
     fi
+    # `vllm serve` runs its engine in a child process, so killing the CLI
+    # parent can orphan it still holding the port and the GPU -- which is how
+    # a failed smoke test left a listener behind that a later job then
+    # benchmarked against by mistake.
+    pkill -9 -u "$USER" -f "vllm serve .*--port ${PORT}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 echo -n "waiting for server"
 UP=0
 for _ in $(seq 1 120); do
-    if health_ok; then UP=1; break; fi
+    # Liveness before health: the other order lets a stale server from an
+    # earlier job answer /health in our place, so we never notice our own
+    # process died on bind.
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo ""
         echo "SERVER DIED DURING STARTUP. Last 60 lines:"
         tail -60 "$LOG"
         exit 1
     fi
+    if health_ok; then UP=1; break; fi
     echo -n "."
     sleep 5
 done
