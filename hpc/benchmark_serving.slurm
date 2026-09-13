@@ -5,7 +5,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64GB
-#SBATCH --time=08:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=logs/tie_bench_%j.out
 #SBATCH --error=logs/tie_bench_%j.err
 
@@ -76,6 +76,24 @@ echo "=== phase 3 benchmark: job $SLURM_JOB_ID ==="
 echo "model=$MODEL arms='$ARMS' rates='$REQUEST_RATES' num_prompts=$NUM_PROMPTS"
 echo "max_num_seqs=$MAX_NUM_SEQS gpu_util=$GPU_UTIL results=$RESULT_DIR"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+# Estimate the wall time up front. A sub-saturation run is arrival-bound
+# (num_prompts/rate); above saturation it is throughput-bound, and the smoke
+# test measured ~6.4 req/s on this hardware. Printing this means a parameter
+# change that would blow the --time budget shows up in the first minute
+# rather than by SLURM killing the job midway through the fourth arm.
+awk -v arms="$ARMS" -v rates="$REQUEST_RATES" -v n="$NUM_PROMPTS" 'BEGIN {
+    n_arms = split(arms, a, " "); split(rates, r, " ");
+    per_arm = 240 + 60;            # server startup + teardown
+    for (i in r) {
+        bound = (r[i] < 6.4) ? r[i] : 6.4;
+        per_arm += n / bound + 10;  # +10s to drain in-flight requests
+    }
+    total = per_arm * n_arms;
+    printf "estimated: %.0f min/arm x %d arms = %.1f h (budget 4.0 h)\n",
+           per_arm/60, n_arms, total/3600;
+    if (total > 3600 * 3.5) print "WARNING: estimate is close to or over the time limit";
+}'
 
 # Per-arm server configuration. GPU_UTIL and MAX_NUM_SEQS are deliberately
 # identical across arms: differing KV cache capacity would make the latency
