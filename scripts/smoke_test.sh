@@ -34,7 +34,11 @@ PORT="${PORT:-8000}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 GPU_UTIL="${GPU_UTIL:-0.88}"
 DATASET="${DATASET:-data/benchmark_prompts.jsonl}"
-LOG="/tmp/smoke_${ARM}_$$.log"
+# Under the submit directory rather than /tmp: /tmp is local to the compute
+# node, so the server log -- which holds the prediction latencies and vLLM's
+# own Running/Waiting counts -- becomes unreadable the moment the job ends.
+mkdir -p logs
+LOG="logs/smoke_${ARM}_${SLURM_JOB_ID:-$$}.log"
 
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export TIE_MODEL_DIR="${TIE_MODEL_DIR:-checkpoints/predictor_full}"

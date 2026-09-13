@@ -52,8 +52,17 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-32}"
 GPU_UTIL="${GPU_UTIL:-0.88}"
 DATASET="${DATASET:-data/benchmark_prompts.jsonl}"
 NUM_PROMPTS="${NUM_PROMPTS:-1000}"
-REQUEST_RATES="${REQUEST_RATES:-2 4 8 16 32}"
-ARMS="${ARMS:-fcfs_pred sjf tie}"
+# The smoke test measured this server topping out at 6.39 req/s on one
+# A100-40GB, so these rates bracket saturation: 2 and 4 sit below it (where
+# the waiting queue stays near-empty and every arm must behave identically --
+# a result worth plotting, not a wasted point), 6 sits on it, and 8/16/32
+# sit above, where scheduling order is the only thing that can differ.
+REQUEST_RATES="${REQUEST_RATES:-2 4 6 8 16 32}"
+# P0 arms first so a job that dies partway still yields the main comparison.
+ARMS="${ARMS:-fcfs_pred sjf tie fcfs tie_oracle}"
+# Prompt order is shuffled from this seed; identical across arms so every arm
+# sees the same workload in the same order.
+BENCH_SEED="${BENCH_SEED:-0}"
 RESULT_DIR="results/bench_${SLURM_JOB_ID}"
 
 # Predictor config, read by vllm_tie/predictor.py.
@@ -170,6 +179,7 @@ for ARM in $ARMS; do
             --dataset-path "$DATASET" \
             --num-prompts "$NUM_PROMPTS" \
             --request-rate "$RATE" \
+            --seed "$BENCH_SEED" \
             --percentile-metrics ttft,tpot,itl,e2el \
             --metric-percentiles 50,90,95,99 \
             --save-result \
@@ -179,6 +189,19 @@ for ARM in $ARMS; do
     done
 
     stop_server
+
+    # Summarise the scheduler's own counters into the job log, so
+    # interpreting a run does not require digging through five server logs.
+    # Not ^-anchored: vLLM prefixes engine-subprocess output with ANSI codes
+    # and "(EngineCore_DP0 pid=NNN)".
+    echo "--- $ARM scheduler counters ---"
+    grep -E "\[TIE\] (predictor loaded|oracle table|final stats)" "$SERVER_LOG" | tail -5 \
+        || echo "(none -- expected for the stock fcfs arm)"
+    echo "last periodic line: $(grep -oE 'waiting=[0-9]+ scored=[0-9]+ popped=[0-9]+ popped_before_prediction=[0-9]+ avg_batch_predict=[0-9.]+ms' "$SERVER_LOG" | tail -1)"
+    echo "max queue depth vLLM reported: $(grep -oE 'Waiting: [0-9]+' "$SERVER_LOG" | awk '{print $2}' | sort -n | tail -1)"
+    echo "preemptions: $(grep -ciE 'preempt' "$SERVER_LOG")"
+    echo "OOM in log: $(grep -ci 'out of memory' "$SERVER_LOG")"
+
     # Let the GPU drain before the next arm claims its memory.
     sleep 20
 done
