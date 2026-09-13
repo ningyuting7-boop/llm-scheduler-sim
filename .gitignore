@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 experiments/*.csv
 .DS_Store
+
+# Model weights and training data are not tracked: best_model.pt alone is
+# ~707MB (far over GitHub's 100MB per-file limit), and the label/sample CSVs
+# are regenerable from scripts/ (see docs/Phase2_Execution_Log.md for the
+# exact commands and the resulting statistics).
+*.pt
+*.pth
+checkpoints/
+data/*.csv
