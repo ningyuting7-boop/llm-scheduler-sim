@@ -11,3 +11,5 @@ experiments/*.csv
 *.pth
 checkpoints/
 data/*.csv
+data/*.jsonl
+results/

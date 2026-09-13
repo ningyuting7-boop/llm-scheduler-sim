@@ -269,26 +269,52 @@ class FCFSWithPredictorScheduler(Scheduler):
 
 | 优先级 | 臂 | 启动方式 | 作用 |
 |---|---|---|---|
-| **P0** | ② **FCFS+Predictor** | `--scheduler-cls vllm_tie.scheduler.FCFSWithPredictorScheduler` | **主对比的基准**，见 4.2 |
-| **P0** | ③ **TIE (真实预测器)** | `--scheduler-cls vllm_tie.scheduler.TIEScheduler`，`UA_MODE=predict` | **主对比** |
-| P1 | ④ TIE-Oracle-σ | 同 ③，`UA_MODE=oracle`（预测器读预计算表） | 解释臂，见 5.2 |
-| P1 | ① FCFS | `vllm serve <qwen3>`（不加任何调度参数，官方默认） | 对外参照 + 量化开销 |
+| **P0** | ② **FCFS+Predictor** | `--scheduler-cls ...FCFSWithPredictorScheduler` | **主对比的基准**，见 4.2 |
+| **P0** | ⑤ **Predicted-SJF** | `--scheduler-cls ...TIEScheduler` + `TIE_BETA=0` | **隔离论文创新点**，见 5.1.1 |
+| **P0** | ③ **TIE (真实预测器)** | `--scheduler-cls ...TIEScheduler` | **主对比** |
+| P1 | ④ TIE-Oracle-σ | 同 ③，`TIE_MODE=oracle` | σ 质量天花板，见 5.2 |
+| P1 | ① FCFS | `vllm serve <qwen3>`（零参数，官方默认） | 对外参照 + 量化开销 |
 
-**先做 ②③ 这一对**（P0）。理由：
+**先做 ②⑤③ 这三臂**（P0）。它们共用同一个二进制、同一个预测器加载路径、同样的 GPU 负载，只差队列类和一个 `TIE_BETA` 环境变量，**边际成本接近零**。
 
-1. 这是**唯一一个 GPU 负载完全对等的对比**——两臂都加载 DeBERTa、都跑预测、都占同样显存，唯一差别是等待队列用不用预测结果。因此 `③−②` 就是**纯调度决策的收益**，单卡部署不引入任何偏差。
-2. ②③ 共用同一份代码（同一个 `vllm_tie` 包、同一个预测器加载路径），只差队列类。跑通 ③ 等于跑通 ②，**边际成本接近零**。
-3. 如果 ③ 相对 ② 没有优势，后面的 ④ 才有意义；如果有优势，阶段三的主结论已经拿到了。
+**①④ 随后补**（P1）：① 是零代码（原版 `vllm serve`）；④ 与 ③ 同一个二进制，只改 `TIE_MODE=oracle`。
 
-**①④ 随后补**（P1），成本都很低：
-- ① 是**零代码**——原封不动的 `vllm serve`，同一个 sbatch job 里多起一次 server 即可。用来算 `②−①` = 预测器部署开销。
-- ④ 和 ③ **同一个二进制**，只改一个环境变量 `UA_MODE=oracle`，不用重新起不同配置的服务。
+五臂**除了调度器全部一致**：同一个模型、同一套 `--max-num-seqs 32 --max-model-len 8192 --no-enable-prefix-caching`，同一份 workload，同一组到达率。
 
-四臂**除了调度器全部一致**：同一个模型、同一套 `--max-num-seqs 32 --max-model-len 8192 --no-enable-prefix-caching`，同一份 workload，同一组到达率。
+> ⚠️ `--gpu-memory-utilization` 必须**五臂取同一个值**。**不能只降带预测器的臂**——否则 KV cache 容量不同，对比无效。以"带预测器的臂能稳定跑起来的最大值"为准（`benchmark_serving.slurm` 默认 0.88）。
 
-> ⚠️ `--gpu-memory-utilization` 必须**四臂取同一个值**。A100-80GB 上可保持 TIE 原版的 0.91；40GB 卡则四臂统一降到 0.85。**不能只降带预测器的臂**——否则 KV cache 容量不同，对比无效。以"带预测器的臂能稳定跑起来的最大值"为准。
+四条正交的读法：
 
-三条正交的读法：**③ vs ②** = 纯调度决策收益（GPU 负载对等，**主结论**）；**② vs ①** = 纯预测器部署开销；**④ vs ③** = σ 预测质量的天花板。
+| 对比 | 测出什么 |
+|---|---|
+| **③ vs ⑤** | **CVaR 项的净贡献**——即论文相对普通 SJF 的创新点 |
+| **⑤ vs ②** | SJF 排序本身的收益（GPU 负载对等） |
+| ② vs ① | 预测器的部署开销 |
+| ④ vs ③ | σ 预测质量的天花板 |
+
+### 5.1.1 为什么必须有 ⑤：CVaR 项在本 workload 上可能几乎不改变排序
+
+**这是一个在消耗任何 GPU 时间之前就测出来的结果**，用 `data/benchmark_oracle_labels.csv`（阶段一用 20 次真实采样拟合出的 σ，即 oracle 质量）直接计算：
+
+```
+CVaR/E[X] 比值:  p10=1.11   median=1.30   p90=1.92   max=8.31
+σ 分位:         p50=0.103  p90=0.257    p99=0.704
+CVaR/E[X] > 2.0 的 prompt: 154 / 1817 = 8.5%
+```
+
+| | Spearman(TIE 排序, 纯 E[X] 排序) | top-32 队头重叠 | top-8 队头重叠 |
+|---|---|---|---|
+| β=0.1（下限，队列不深时的常态） | **0.99957** | 96.9% | 75.0% |
+| β=0.3 | 0.99791 | 93.8% | 62.5% |
+| β=0.5（上限） | **0.99625** | 93.8% | 62.5% |
+
+**即使用完美的 σ，TIE 的排序也几乎等于按 E[X] 排序**：top-32（正好是 `max_num_seqs`，也就是一批要调度的量）只有 1–2 个位置不同。原因是本 workload 的 σ 太小——Qwen3-8B 在官方采样参数下，多数 prompt 的输出长度相当稳定。
+
+**后果**：`③ vs ②` 大概率会显示 TIE 有显著收益，**但那个收益来自 SJF 排序，不是来自论文的不确定性感知**。没有 ⑤ 这一臂就无法区分这两者，而区分它们正是复现这篇论文的意义所在。
+
+> 这条同时也是一个**独立于 GPU 实验的、可直接写进报告的发现**：在我们的 workload 上，TIE 打分的排序与按期望长度排序的一致性达到 Spearman ≥ 0.996，因此 CVaR 项能贡献的上限本身就很小——**与预测器质量无关**。若 GPU 实验测出 `③ ≈ ⑤`，这个计算就是它的机制解释；若测出 `③ > ⑤`，则说明那 8.5% 的高不确定性 prompt 在饱和时的影响被放大了，同样是有价值的结果。
+>
+> 复现命令见 `scripts/rank_agreement_check.py`。
 
 ### 5.2 TIE-Oracle-σ：让结果可解释的关键
 
@@ -339,37 +365,34 @@ class FCFSWithPredictorScheduler(Scheduler):
 
 ## 6. 任务清单
 
-| # | 任务 | 依赖 | 需要 GPU | 预估 |
+| # | 任务 | 状态 | 需要 GPU | 产物 |
 |---|---|---|---|---|
-| 1 | 装 `vllm==0.11.1` 官方 wheel，跑通 3.4 的四项验证（含空子类 `--scheduler-cls` 冒烟） | — | 否* | 1–2 h |
-| 2 | 建 `vllm_tie/` 包：移植 `request_queue.py` / `ua_score_calculator.py`（注明改编自 TIE）。**同时把 `max_batch_size` 从 128 降到 16–32**（见第 4 节显存警告） | 1 | 否 | 2–3 h |
-| 3 | 写 `vllm_tie/scheduler.py`：`TIEScheduler(Scheduler)` 换 `self.waiting`；外加 `FCFSWithPredictorScheduler`（同样加载预测器但保留 FCFS 队列，见 4.2） | 2 | 否 | 1–2 h |
-| 4 | 移植 `ua_predictor.py`：接我们的 `LengthDistributionPredictor`（fp16 加载），填掉所有 `"xxx"` 占位符 | 2 | 否 | 1–2 h |
-| 5 | checkpoint 对接（见第 2 节）：因为加载代码是我们自己的，直接改成读我们的格式，不用转文件 | 4 | 否 | 30 min |
-| 6 | 导出 test split prompt 成 benchmark 数据集格式 | — | 否 | 1 h |
-| 7 | 写 `hpc/benchmark_serving.slurm`：`--gres=gpu:a100:1`，一个 job 内依次起各臂 server → 压测 → 停 | — | 否 | 1–2 h |
+| 1 | `vllm_tie/score_calculator.py`：log-t 截断 E[X] / CVaR（照论文重写，非复制） | ✅ | 否 | 已测（`tests/test_vllm_tie.py`） |
+| 2 | `vllm_tie/predictor.py`：接阶段二 checkpoint、自适应 β、chat template 剥离、oracle 查表 | ✅ | 否 | torch 惰性导入，核心逻辑可离线测 |
+| 3 | `vllm_tie/request_queue.py`：`TIERequestQueue`（改编自 TIE）+ `FCFSWithPredictionQueue` | ✅ | 否 | worker 抽成共享基类 |
+| 4 | `vllm_tie/scheduler.py`：`TIEScheduler` / `FCFSWithPredictorScheduler` | ✅ | 否 | 各 ~10 行，只换 `self.waiting` |
+| 5 | `scripts/export_benchmark_dataset.py`：test split → jsonl + oracle CSV | ✅ | 否 | 1,817 prompt，**oracle 标签 100% 覆盖** |
+| 6 | `scripts/rank_agreement_check.py`：CVaR 项到底改不改排序 | ✅ | 否 | **见 5.1.1 的发现** |
+| 7 | `hpc/benchmark_serving.slurm`：`gpu:a100:1`，一 job 跑完所有臂 | ✅ | 否 | `ARMS` 可覆盖 |
+| 8 | 装 `vllm==0.11.1`，跑通 3.4 的四项验证 | ⬜ | 否* | **下一步** |
 | **P0 到此为止 ↑，下面进 GPU** | | | | |
-| 8 | 冒烟：起 ② server 确认服务正常；起 ③ server 确认预测器加载、日志有 `[UA]`、score 非退化（不能全是 2048） | 1,3,5 | 是 | 2 h |
-| 9 | 饱和度标定：在 ② 上扫 request-rate 找 `Waiting > 0` 区间；定死四臂统一的 `--gpu-memory-utilization`（见 5.1） | 8 | 是 | 2 h |
-| 10 | **主实验：② vs ③** × 多个 request-rate | 6,7,9 | 是 | 半天 |
-| 11 | **中期分析**：`③−②` 有无差异？据此决定 ④ 的定位 | 10 | 否 | 半天 |
+| 9 | 冒烟：起 ② 确认服务正常；起 ③ 确认预测器加载、`popped_before_prediction` 不是全部 | ⬜ | 是 | 2 h |
+| 10 | 饱和度标定：扫 request-rate 找 `Waiting > 0` 区间；定死五臂统一的 `--gpu-memory-utilization` | ⬜ | 是 | 2 h |
+| 11 | **主实验：② / ⑤ / ③** × 多个 request-rate | ⬜ | 是 | 半天 |
+| 12 | **中期分析**：`③−⑤`（CVaR 净贡献）和 `⑤−②`（SJF 收益）各是多少 | ⬜ | 否 | 半天 |
 | **P1 补充臂 ↓** | | | | |
-| 12 | 实现 Oracle-σ 查表模式（`UA_MODE=oracle` 分支 + 预计算 CSV） | 4 | 否 | 2 h |
-| 13 | 补跑 ① 和 ④（① 零代码；④ 与 ③ 同一个二进制，只改环境变量） | 11,12 | 是 | 半天 |
-| 14 | 结果分析 + 画图 + 写报告章节 | 13 | 否 | 1 天 |
+| 13 | 补跑 ① 和 ④（都是零新代码，改 `ARMS` 即可） | ⬜ | 是 | 半天 |
+| 14 | 结果分析 + 画图 + 写报告章节 | ⬜ | 否 | 1 天 |
 
-\* 任务 1 的前三项在本地/登录节点就能做（纯 import 检查）；第四项（起服务）需要 GPU，可以并到任务 8。
+\* 任务 8 的前三项（纯 import 检查）在登录节点就能做；第四项（起服务）需要 GPU，可并入任务 9。
 
-**顺序建议**：1 → 2、3、4、5、6、7（**全部纯 CPU**，可在等 GPU 排队时做完）→ 8 → 9 → **10、11（主实验，拿到核心结论）** → 12、13 → 14。
+**为什么在 12 设中期分析点**：三臂的差值直接决定后续。
 
-**为什么在 11 设一个中期分析点**：`③−②` 的结果直接决定后续怎么走。
+- `⑤ − ②` 显著、`③ − ⑤` 不显著 → **SJF 有效但 CVaR 项无贡献**，与 5.1.1 的排序计算吻合，这是一个完整的结论，④ 只用来确认"换成完美 σ 也一样"
+- `③ − ⑤` 显著 → 不确定性感知确实起作用，④ 升级为必做，用来量化 σ 质量的天花板
+- `⑤ ≈ ②` → 连 SJF 都没收益，先回头查饱和度和 `popped_before_prediction`，很可能是队列根本没排上队
 
-- 若 ③ 明显优于 ② → **主结论已成立**（TIE 调度在真实 vLLM 上有效），④ 只是锦上添花，用来量化"σ 预测器还有多少改进空间"
-- 若 ③ 与 ② 无差异 → ④ **升级为必做**，它是区分"CVaR 方法本身无效"和"我们的 σ̂ 无信息量"的唯一手段
-
-**不要在拿到 `③−②` 之前就把 GPU 时间花在 ④ 上。**
-
-> 相比改为外挂方案之前，原来的"任务 2：在 HPC 上编译安装 vLLM fork（0.5–1 天，高失败风险）"被 `pip install` 取代；原任务 4（转 checkpoint 格式去迁就 TIE 的加载器）也不再需要——加载代码现在是我们自己的。
+> 相比改为外挂方案之前，原"在 HPC 上编译安装 vLLM fork（0.5–1 天，高失败风险）"被 `pip install` 取代；原"转 checkpoint 格式去迁就 TIE 的加载器"也不再需要——加载代码现在是我们自己的。
 
 ---
 
