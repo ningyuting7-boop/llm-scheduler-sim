@@ -52,7 +52,10 @@ def compute_pass_rates(samples_path: str, alpha: float = 0.05, min_samples: int 
                 continue
 
             arr = np.asarray(lengths, dtype=float)
-            if float(np.std(np.log(arr))) == 0.0:
+            # See src/logt_fit.py _DEGENERATE_STD_THRESHOLD: np.std of
+            # numerically-identical values is ~1e-16, essentially never
+            # exactly 0.0.
+            if float(np.std(np.log(arr))) < 1e-8:
                 n_degenerate += 1
                 continue
 
