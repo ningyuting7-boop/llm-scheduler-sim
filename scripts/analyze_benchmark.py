@@ -1,30 +1,30 @@
 """Turn a phase 3 benchmark run into the numbers the report needs.
 
 Reads the per-(arm, rate) JSON files written by `vllm bench serve
---save-result` and produces three things:
+--save-result` and reports TTFT, TPOT and throughput, then the four planned
+contrasts (docs/Phase3_Scheduling_Evaluation_Plan.md section 5.1). Each
+contrast changes exactly one thing:
 
-1. A summary table of latency, throughput and fairness per arm and rate.
-2. The four planned contrasts (docs/Phase3_Scheduling_Evaluation_Plan.md
-   section 5.1), each of which isolates one variable:
+    tie        - sjf          the CVaR term, i.e. the paper's contribution
+    sjf        - fcfs_pred    shortest-job-first ordering, GPU load held equal
+    fcfs_pred  - fcfs         what deploying the predictor costs
+    tie_oracle - tie          headroom from a better sigma predictor
 
-       tie  - sjf        the CVaR term, i.e. the paper's contribution
-       sjf  - fcfs_pred  shortest-job-first ordering, GPU load held equal
-       fcfs_pred - fcfs  what deploying the predictor costs
-       tie_oracle - tie  how much a better sigma predictor could buy
+Reading the output:
 
-3. A mechanism check: the rank correlation between a request's output
-   length and its TTFT. Aggregate latency can move for all sorts of
-   reasons, but if length-aware scheduling is working at all then short
-   requests must be getting served first, and this measures that directly.
-   Under FCFS it should sit near zero by construction, which also serves as
-   a sanity check that the arms really are running different policies.
-
-Two metrics are computed here rather than taken from the JSON:
-
-  * Jain's fairness index over TTFT, which the benchmark does not report.
-    J = (sum x)^2 / (n * sum x^2): 1.0 when every request waits equally,
-    1/n when one request absorbs all the waiting.
-  * The length/TTFT correlation, which needs the raw per-request arrays.
+  * TTFT is where scheduling shows up. It is queueing delay -- how long a
+    request waited before the batch had room for it -- so a policy that
+    serves short requests first should lower mean TTFT and raise the tail,
+    because the long requests it defers are the ones that pay.
+  * TPOT should barely move. Once a request is in the running batch it
+    decodes at a rate set by batch size and the GPU, not by what put it
+    there. A large TPOT gap between arms is more likely a load artefact
+    than a scheduling result.
+  * Throughput over a whole run is near-constant by construction: every arm
+    processes the same 1000 prompts, so total token work is fixed and the
+    GPU is the bottleneck. Differences show up in *when* requests finish,
+    not how many -- so read throughput as a check that no arm broke, not as
+    a result.
 
 Usage:
     python scripts/analyze_benchmark.py results/bench_10330173
@@ -55,7 +55,7 @@ ARM_LABELS = {
 }
 ARM_ORDER = ["fcfs", "fcfs_pred", "sjf", "tie", "tie_oracle"]
 
-# (better, baseline, what the difference isolates)
+# (arm, baseline, what the difference isolates)
 CONTRASTS = [
     ("tie", "sjf", "CVaR term (the paper's contribution)"),
     ("sjf", "fcfs_pred", "SJF ordering, GPU load held equal"),
@@ -63,56 +63,37 @@ CONTRASTS = [
     ("tie_oracle", "tie", "headroom from a better sigma predictor"),
 ]
 
+# Metrics carried through the summary, the contrasts and the plots.
+METRICS = [
+    ("mean_ttft_ms", "mean TTFT", "ms"),
+    ("p99_ttft_ms", "P99 TTFT", "ms"),
+    ("mean_tpot_ms", "mean TPOT", "ms"),
+    ("p99_tpot_ms", "P99 TPOT", "ms"),
+    ("mean_e2el_ms", "mean E2E", "ms"),
+    ("req_throughput", "req/s", ""),
+    ("tok_throughput", "tok/s", ""),
+]
+
 FILENAME_RE = re.compile(r"^(?P<arm>[a-z_]+)_rate(?P<rate>[0-9.]+)\.json$")
-
-
-def jains_index(values: np.ndarray) -> float:
-    """1.0 = every request waited the same; 1/n = one request absorbed it all."""
-    values = np.asarray(values, dtype=float)
-    if values.size == 0 or not np.any(values > 0):
-        return float("nan")
-    return float(values.sum() ** 2 / (values.size * np.square(values).sum()))
-
-
-def length_ttft_correlation(output_lens, ttfts) -> float:
-    """Spearman rho between output length and TTFT.
-
-    Positive means longer requests waited longer, which is what
-    length-aware scheduling is supposed to produce. Near zero is the FCFS
-    signature: arrival order carries no information about length.
-    """
-    from scipy.stats import spearmanr
-
-    lens = np.asarray(output_lens, dtype=float)
-    ttfts = np.asarray(ttfts, dtype=float)
-    ok = np.isfinite(lens) & np.isfinite(ttfts)
-    if ok.sum() < 10:
-        return float("nan")
-    return float(spearmanr(lens[ok], ttfts[ok]).correlation)
 
 
 def load_run(path: Path) -> dict:
     with path.open() as f:
         raw = json.load(f)
-
-    ttfts_s = np.asarray(raw.get("ttfts", []), dtype=float)
-    ttfts_ms = ttfts_s * 1000.0
-    out_lens = raw.get("output_lens", [])
-
+    nan = float("nan")
     return {
         "completed": raw.get("completed", 0),
         "failed": raw.get("failed", 0),
-        "duration_s": raw.get("duration", float("nan")),
-        "req_throughput": raw.get("request_throughput", float("nan")),
-        "tok_throughput": raw.get("output_throughput", float("nan")),
-        "mean_ttft_ms": raw.get("mean_ttft_ms", float("nan")),
-        "p50_ttft_ms": raw.get("p50_ttft_ms", raw.get("median_ttft_ms", float("nan"))),
-        "p99_ttft_ms": raw.get("p99_ttft_ms", float("nan")),
-        "mean_e2el_ms": raw.get("mean_e2el_ms", float("nan")),
-        "p99_e2el_ms": raw.get("p99_e2el_ms", float("nan")),
-        "jain_ttft": jains_index(ttfts_ms),
-        "len_ttft_rho": length_ttft_correlation(out_lens, ttfts_ms),
-        "mean_output_len": float(np.mean(out_lens)) if len(out_lens) else float("nan"),
+        "duration_s": raw.get("duration", nan),
+        "req_throughput": raw.get("request_throughput", nan),
+        "tok_throughput": raw.get("output_throughput", nan),
+        "mean_ttft_ms": raw.get("mean_ttft_ms", nan),
+        "p50_ttft_ms": raw.get("p50_ttft_ms", raw.get("median_ttft_ms", nan)),
+        "p99_ttft_ms": raw.get("p99_ttft_ms", nan),
+        "mean_tpot_ms": raw.get("mean_tpot_ms", nan),
+        "p99_tpot_ms": raw.get("p99_tpot_ms", nan),
+        "mean_e2el_ms": raw.get("mean_e2el_ms", nan),
+        "p99_e2el_ms": raw.get("p99_e2el_ms", nan),
     }
 
 
@@ -126,8 +107,8 @@ def load_all(results_dir: Path) -> dict[tuple[str, float], dict]:
     return runs
 
 
-def fmt(value: float, width: int = 9, prec: int = 1) -> str:
-    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+def fmt(value, width: int = 9, prec: int = 1) -> str:
+    if value is None or not np.isfinite(value):
         return " " * (width - 1) + "-"
     return f"{value:{width}.{prec}f}"
 
@@ -136,13 +117,14 @@ def print_summary(runs: dict) -> None:
     arms = [a for a in ARM_ORDER if any(k[0] == a for k in runs)]
     rates = sorted({k[1] for k in runs})
 
-    print("=" * 100)
+    print("=" * 104)
     print("SUMMARY")
-    print("=" * 100)
+    print("=" * 104)
     header = (
         f"{'arm':<20}{'rate':>6}{'done':>6}{'fail':>5}"
-        f"{'thru/s':>9}{'meanTTFT':>10}{'p50TTFT':>9}{'p99TTFT':>10}"
-        f"{'p99E2E':>10}{'Jain':>7}{'len~TTFT':>9}"
+        f"{'req/s':>8}{'tok/s':>9}"
+        f"{'meanTTFT':>10}{'p50TTFT':>9}{'p99TTFT':>10}"
+        f"{'meanTPOT':>10}{'p99TPOT':>9}{'meanE2E':>10}"
     )
     print(header)
     print("-" * len(header))
@@ -154,84 +136,81 @@ def print_summary(runs: dict) -> None:
             print(
                 f"{ARM_LABELS.get(arm, arm):<20}{rate:>6.0f}"
                 f"{r['completed']:>6}{r['failed']:>5}"
-                f"{fmt(r['req_throughput'], 9, 2)}"
-                f"{fmt(r['mean_ttft_ms'], 10)}"
-                f"{fmt(r['p50_ttft_ms'], 9)}"
+                f"{fmt(r['req_throughput'], 8, 2)}{fmt(r['tok_throughput'], 9, 0)}"
+                f"{fmt(r['mean_ttft_ms'], 10)}{fmt(r['p50_ttft_ms'], 9)}"
                 f"{fmt(r['p99_ttft_ms'], 10)}"
-                f"{fmt(r['p99_e2el_ms'], 10)}"
-                f"{fmt(r['jain_ttft'], 7, 3)}"
-                f"{fmt(r['len_ttft_rho'], 9, 3)}"
+                f"{fmt(r['mean_tpot_ms'], 10, 2)}{fmt(r['p99_tpot_ms'], 9, 2)}"
+                f"{fmt(r['mean_e2el_ms'], 10)}"
             )
         print()
 
 
 def print_contrasts(runs: dict) -> None:
     rates = sorted({k[1] for k in runs})
-    print("=" * 100)
-    print("CONTRASTS  (negative = the first arm is faster; % of the baseline)")
-    print("=" * 100)
+    print("=" * 104)
+    print("CONTRASTS  (percent change vs the baseline arm)")
+    print("  latency: negative is better.  throughput: positive is better.")
+    print("=" * 104)
 
-    for better, baseline, what in CONTRASTS:
-        pairs = [r for r in rates if (better, r) in runs and (baseline, r) in runs]
-        if not pairs:
+    keys = [
+        ("mean_ttft_ms", "meanTTFT"),
+        ("p99_ttft_ms", "p99TTFT"),
+        ("mean_tpot_ms", "meanTPOT"),
+        ("mean_e2el_ms", "meanE2E"),
+        ("req_throughput", "req/s"),
+    ]
+
+    for arm, baseline, what in CONTRASTS:
+        shared = [r for r in rates if (arm, r) in runs and (baseline, r) in runs]
+        if not shared:
             continue
-        print(f"\n{ARM_LABELS.get(better, better)}  vs  {ARM_LABELS.get(baseline, baseline)}")
+        print(f"\n{ARM_LABELS.get(arm, arm)}  vs  {ARM_LABELS.get(baseline, baseline)}")
         print(f"  isolates: {what}")
-        header = f"  {'rate':>6}{'meanTTFT':>12}{'p99TTFT':>12}{'p99E2E':>12}{'Jain':>12}"
+        header = "  " + f"{'rate':>6}" + "".join(f"{label:>12}" for _, label in keys)
         print(header)
         print("  " + "-" * (len(header) - 2))
-        for rate in pairs:
-            a, b = runs[(better, rate)], runs[(baseline, rate)]
-
-            def pct(key: str) -> str:
+        for rate in shared:
+            a, b = runs[(arm, rate)], runs[(baseline, rate)]
+            cells = []
+            for key, _ in keys:
                 x, y = a[key], b[key]
                 if not (np.isfinite(x) and np.isfinite(y)) or y == 0:
-                    return "         -"
-                return f"{100.0 * (x - y) / y:+11.1f}%"
-
-            print(
-                f"  {rate:>6.0f}{pct('mean_ttft_ms')}{pct('p99_ttft_ms')}"
-                f"{pct('p99_e2el_ms')}{pct('jain_ttft')}"
-            )
+                    cells.append(f"{'-':>12}")
+                else:
+                    cells.append(f"{100.0 * (x - y) / y:+11.1f}%")
+            print(f"  {rate:>6.0f}" + "".join(cells))
 
 
-def print_mechanism_check(runs: dict) -> None:
-    """Did the arms actually schedule differently?
+def print_saturation_note(runs: dict) -> None:
+    """Which rates actually queued?
 
-    Aggregate latencies can coincide for uninteresting reasons. A
-    length-aware policy must show longer requests waiting longer; FCFS
-    cannot, because arrival order is independent of length. If the
-    length-aware arms do not separate from the FCFS arms here, the run did
-    not test what it was meant to -- most likely the queue never had depth.
+    Scheduling order can only matter once the running batch is full; below
+    that a request is admitted on arrival and every arm behaves identically.
+    A near-zero TTFT is the signature of that regime, so flagging it keeps
+    'no difference between arms' at low rates from being read as a finding.
     """
     rates = sorted({k[1] for k in runs})
-    arms = [a for a in ARM_ORDER if any(k[0] == a for k in runs)]
-
-    print("\n" + "=" * 100)
-    print("MECHANISM CHECK: Spearman(output length, TTFT)")
-    print("  length-aware arms should be clearly positive; FCFS arms near zero")
-    print("=" * 100)
-    header = f"{'arm':<20}" + "".join(f"{r:>9.0f}" for r in rates)
-    print(header)
-    print("-" * len(header))
-    for arm in arms:
-        row = "".join(
-            fmt(runs[(arm, r)]["len_ttft_rho"], 9, 3) if (arm, r) in runs else " " * 9
-            for r in rates
+    ref = "fcfs_pred" if any(k[0] == "fcfs_pred" for k in runs) else ARM_ORDER[0]
+    print("\n" + "=" * 104)
+    print(f"SATURATION (from the {ARM_LABELS.get(ref, ref)} arm)")
+    print("=" * 104)
+    queued, idle = [], []
+    for rate in rates:
+        r = runs.get((ref, rate))
+        if r is None or not np.isfinite(r["p99_ttft_ms"]):
+            continue
+        (queued if r["p99_ttft_ms"] > 500 else idle).append(rate)
+        print(
+            f"  rate {rate:>4.0f}: p99 TTFT {fmt(r['p99_ttft_ms'], 9)} ms, "
+            f"throughput {fmt(r['req_throughput'], 6, 2)} req/s"
+            + ("   <- queueing" if r["p99_ttft_ms"] > 500 else "   <- no queueing")
         )
-        print(f"{ARM_LABELS.get(arm, arm):<20}{row}")
-
-    saturated = [
-        r
-        for r in rates
-        if ("fcfs_pred", r) in runs
-        and np.isfinite(runs[("fcfs_pred", r)]["p99_ttft_ms"])
-        and runs[("fcfs_pred", r)]["p99_ttft_ms"] > 1000
-    ]
-    print(
-        f"\nrates where the queue clearly had depth (baseline p99 TTFT > 1s): "
-        f"{saturated if saturated else 'none -- the run never saturated'}"
-    )
+    print(f"\n  rates where scheduling could matter: {queued or 'none'}")
+    if idle:
+        print(
+            f"  rates with an empty waiting queue: {idle}\n"
+            f"    arms are expected to be identical here; that is the control, not a null result"
+        )
 
 
 def make_plots(runs: dict, out_dir: Path) -> None:
@@ -239,18 +218,20 @@ def make_plots(runs: dict, out_dir: Path) -> None:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import ScalarFormatter
 
     rates = sorted({k[1] for k in runs})
     arms = [a for a in ARM_ORDER if any(k[0] == a for k in runs)]
     out_dir.mkdir(parents=True, exist_ok=True)
 
     panels = [
-        ("mean_ttft_ms", "Mean TTFT (ms)", "mean_ttft"),
-        ("p99_ttft_ms", "P99 TTFT (ms)", "p99_ttft"),
-        ("p99_e2el_ms", "P99 end-to-end latency (ms)", "p99_e2el"),
-        ("jain_ttft", "Jain fairness index over TTFT", "jain"),
+        ("mean_ttft_ms", "Mean TTFT (ms)", "mean_ttft", True),
+        ("p99_ttft_ms", "P99 TTFT (ms)", "p99_ttft", True),
+        ("mean_tpot_ms", "Mean TPOT (ms)", "mean_tpot", False),
+        ("req_throughput", "Request throughput (req/s)", "req_throughput", False),
+        ("tok_throughput", "Output token throughput (tok/s)", "tok_throughput", False),
     ]
-    for key, ylabel, stem in panels:
+    for key, ylabel, stem, log_y in panels:
         fig, ax = plt.subplots(figsize=(7, 4.5))
         for arm in arms:
             xs = [r for r in rates if (arm, r) in runs]
@@ -260,8 +241,8 @@ def make_plots(runs: dict, out_dir: Path) -> None:
         ax.set_ylabel(ylabel)
         ax.set_xscale("log", base=2)
         ax.set_xticks(rates)
-        ax.get_xaxis().set_major_formatter(matplotlib.ticker.ScalarFormatter())
-        if key != "jain_ttft":
+        ax.get_xaxis().set_major_formatter(ScalarFormatter())
+        if log_y:
             ax.set_yscale("log")
         ax.grid(alpha=0.3, linewidth=0.5)
         ax.legend(frameon=False, fontsize=8)
@@ -291,7 +272,7 @@ def main() -> None:
 
     print_summary(runs)
     print_contrasts(runs)
-    print_mechanism_check(runs)
+    print_saturation_note(runs)
 
     if args.plot:
         make_plots(runs, Path(args.plot_dir or results_dir / "figures"))

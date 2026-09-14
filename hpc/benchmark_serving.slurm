@@ -89,7 +89,10 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 # rather than by SLURM killing the job midway through the fourth arm.
 awk -v arms="$ARMS" -v rates="$REQUEST_RATES" -v n="$NUM_PROMPTS" 'BEGIN {
     n_arms = split(arms, a, " "); split(rates, r, " ");
-    per_arm = 240 + 60;            # server startup + teardown
+    # Startup measured at ~17 min, not the 4 min first assumed: loading 16GB
+    # of weights over the shared /scratch filesystem plus CUDA graph capture
+    # dominates, and it is paid once per arm.
+    per_arm = 1020 + 60;           # server startup + teardown
     for (i in r) {
         bound = (r[i] < 6.4) ? r[i] : 6.4;
         per_arm += n / bound + 10;  # +10s to drain in-flight requests
@@ -238,6 +241,7 @@ for ARM in $ARMS; do
             --metric-percentiles 50,90,95,99 \
             --ready-check-timeout-sec 60 \
             --save-result \
+            --save-detailed \
             --result-dir "$RESULT_DIR" \
             --result-filename "${ARM}_rate${RATE}.json" \
             2>&1 | tee "$RESULT_DIR/bench_${ARM}_rate${RATE}.log"
