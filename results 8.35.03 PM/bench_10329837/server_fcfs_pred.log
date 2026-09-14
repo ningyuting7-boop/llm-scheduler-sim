@@ -1,0 +1,30 @@
+INFO 09-13 19:06:10 [scheduler.py:216] Chunked prefill is enabled with max_num_batched_tokens=2048.
+[1;36m(APIServer pid=372724)[0;0m INFO 09-13 19:06:10 [api_server.py:1977] vLLM API server version 0.11.1
+[1;36m(APIServer pid=372724)[0;0m INFO 09-13 19:06:10 [utils.py:253] non-default args: {'model_tag': 'Qwen/Qwen3-8B', 'model': 'Qwen/Qwen3-8B', 'max_model_len': 8192, 'gpu_memory_utilization': 0.88, 'enable_prefix_caching': False, 'max_num_seqs': 32, 'scheduler_cls': 'vllm_tie.scheduler.FCFSWithPredictorScheduler'}
+[1;36m(APIServer pid=372724)[0;0m Traceback (most recent call last):
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/bin/vllm", line 6, in <module>
+[1;36m(APIServer pid=372724)[0;0m     sys.exit(main())
+[1;36m(APIServer pid=372724)[0;0m              ^^^^^^
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/lib/python3.11/site-packages/vllm/entrypoints/cli/main.py", line 73, in main
+[1;36m(APIServer pid=372724)[0;0m     args.dispatch_function(args)
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/lib/python3.11/site-packages/vllm/entrypoints/cli/serve.py", line 60, in cmd
+[1;36m(APIServer pid=372724)[0;0m     uvloop.run(run_server(args))
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/lib/python3.11/site-packages/uvloop/__init__.py", line 92, in run
+[1;36m(APIServer pid=372724)[0;0m     return runner.run(wrapper())
+[1;36m(APIServer pid=372724)[0;0m            ^^^^^^^^^^^^^^^^^^^^^
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/lib/python3.11/asyncio/runners.py", line 118, in run
+[1;36m(APIServer pid=372724)[0;0m     return self._loop.run_until_complete(task)
+[1;36m(APIServer pid=372724)[0;0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[1;36m(APIServer pid=372724)[0;0m   File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/lib/python3.11/site-packages/uvloop/__init__.py", line 48, in wrapper
+[1;36m(APIServer pid=372724)[0;0m     return await main
+[1;36m(APIServer pid=372724)[0;0m            ^^^^^^^^^^
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/lib/python3.11/site-packages/vllm/entrypoints/openai/api_server.py", line 2023, in run_server
+[1;36m(APIServer pid=372724)[0;0m     listen_address, sock = setup_server(args)
+[1;36m(APIServer pid=372724)[0;0m                            ^^^^^^^^^^^^^^^^^^
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/lib/python3.11/site-packages/vllm/entrypoints/openai/api_server.py", line 1995, in setup_server
+[1;36m(APIServer pid=372724)[0;0m     sock = create_server_socket(sock_addr)
+[1;36m(APIServer pid=372724)[0;0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[1;36m(APIServer pid=372724)[0;0m   File "/scratch/ning.yuti/envs/tie-repro/lib/python3.11/site-packages/vllm/entrypoints/openai/api_server.py", line 1944, in create_server_socket
+[1;36m(APIServer pid=372724)[0;0m     sock.bind(addr)
+[1;36m(APIServer pid=372724)[0;0m OSError: [Errno 98] Address already in use

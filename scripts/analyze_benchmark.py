@@ -66,6 +66,7 @@ CONTRASTS = [
 # Metrics carried through the summary, the contrasts and the plots.
 METRICS = [
     ("mean_ttft_ms", "mean TTFT", "ms"),
+    ("p90_ttft_ms", "P90 TTFT", "ms"),
     ("p99_ttft_ms", "P99 TTFT", "ms"),
     ("mean_tpot_ms", "mean TPOT", "ms"),
     ("p99_tpot_ms", "P99 TPOT", "ms"),
@@ -89,6 +90,7 @@ def load_run(path: Path) -> dict:
         "tok_throughput": raw.get("output_throughput", nan),
         "mean_ttft_ms": raw.get("mean_ttft_ms", nan),
         "p50_ttft_ms": raw.get("p50_ttft_ms", raw.get("median_ttft_ms", nan)),
+        "p90_ttft_ms": raw.get("p90_ttft_ms", nan),
         "p99_ttft_ms": raw.get("p99_ttft_ms", nan),
         "mean_tpot_ms": raw.get("mean_tpot_ms", nan),
         "p99_tpot_ms": raw.get("p99_tpot_ms", nan),
@@ -152,11 +154,19 @@ def print_contrasts(runs: dict) -> None:
     print("  latency: negative is better.  throughput: positive is better.")
     print("=" * 104)
 
+    # p50 comes first because under saturation it is the only TTFT statistic
+    # that moves. Total queueing delay is close to conserved once throughput
+    # is capped -- the area under the queue-length curve depends on arrivals
+    # and service rate, not on the order requests are served in -- so
+    # reordering redistributes waiting rather than removing it, leaving the
+    # mean flat while the median and the tail pull apart. A table showing
+    # only the mean would report a 7x improvement as "no effect".
     keys = [
+        ("p50_ttft_ms", "p50TTFT"),
         ("mean_ttft_ms", "meanTTFT"),
+        ("p90_ttft_ms", "p90TTFT"),
         ("p99_ttft_ms", "p99TTFT"),
         ("mean_tpot_ms", "meanTPOT"),
-        ("mean_e2el_ms", "meanE2E"),
         ("req_throughput", "req/s"),
     ]
 
@@ -226,6 +236,7 @@ def make_plots(runs: dict, out_dir: Path) -> None:
 
     panels = [
         ("mean_ttft_ms", "Mean TTFT (ms)", "mean_ttft", True),
+        ("p50_ttft_ms", "Median TTFT (ms)", "p50_ttft", True),
         ("p99_ttft_ms", "P99 TTFT (ms)", "p99_ttft", True),
         ("mean_tpot_ms", "Mean TPOT (ms)", "mean_tpot", False),
         ("req_throughput", "Request throughput (req/s)", "req_throughput", False),
