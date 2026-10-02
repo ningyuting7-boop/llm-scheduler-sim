@@ -689,3 +689,38 @@ if not args.save_detailed:
 2. **rate 32 时 SJF 的 p50 优势为什么几乎消失**。我排除了预测延迟（高负载下未打分比例 0–6%）和老化机制（衰减幅度不足以翻转 48 倍的分数差）。$p^*=100/\rho$ 规律预测它应该恶化，实测是持平，在噪声量级内。要定论需要逐请求数据。
 3. **论文自己报告的 σ 预测精度**。我没下载到论文正文核对，所以不知道我的 R²=0.05 是"复现失败"还是"成功复现了一个已知难点"。
 4. **他们的 σ 为什么比我的宽**。代码里有间接证据（`compute_sample_weights()` 把 `logt_sigma > 1.0` 当作值得上采样的群体，而这在我的标签上只命中 0.36%）。**采样次数这个解释我测过并排除了**——20 次已达渐近值 96.5%，加到 100 次只涨 2.9%（§7.4）。剩下的候选是模型不同、采样参数不同、或者我关掉了 Qwen3 的 thinking mode。**我倾向于最后一个，但没验证。**
+
+---
+
+## 附：复现
+
+```bash
+# 1. 关口检查：外挂能不能挂上去（纯 CPU，18 项）
+python scripts/verify_vllm_integration.py
+
+# 2. 生成 workload 与 oracle 标签（检查标签覆盖率）
+python scripts/export_benchmark_dataset.py
+
+# 3. 实验前的排序一致性分析（§6.3）——这一步决定了要加第 5 臂
+TIE_SCORE_SEED=0 python scripts/rank_agreement_check.py
+
+# 4. 采样次数对 sigma 的影响（§7.4，不要 GPU，约 1 分钟）
+python scripts/sigma_sample_size_bias.py
+
+# 5. 单臂冒烟（GPU）
+bash scripts/smoke_test.sh tie 60 32
+
+# 6. 全量基准：5 臂 × 6 速率
+sbatch hpc/benchmark_serving.slurm
+
+# 7. 分析 + 出图
+python scripts/analyze_benchmark.py results/bench_<jobid> --plot
+```
+
+相关文档：
+
+| 文件 | 内容 |
+|---|---|
+| [`Phase2_Execution_Log.md`](Phase2_Execution_Log.md) | 阶段二完整记录：每次消融的配置和结果 |
+| [`Phase3_Scheduling_Evaluation_Plan.md`](Phase3_Scheduling_Evaluation_Plan.md) | 阶段三设计：为什么是这五个臂 |
+| [`Phase3_Results.md`](Phase3_Results.md) | 阶段三结果：30 轮全量数据和机制分析 |
