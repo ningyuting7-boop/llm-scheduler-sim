@@ -129,7 +129,83 @@ SchedulerPolicy = Literal["fcfs", "priority"]
 **TTFT = 在 waiting 里待的时间 + 第一次 prefill/decode 的时间**，在饱和时几乎完全由排队时间主导。这就是为什么调度只影响 TTFT，不影响 TPOT。
 </details>
 
-### Q3.2 KV cache 是怎么管理的？你测到多少？
+### Q3.2 `schedule()` 具体做什么？调度策略在哪一行起作用？
+
+**骨架**（`vllm/v1/core/sched/scheduler.py:243`）：
+
+```python
+def schedule(self):
+    token_budget = self.max_num_scheduled_tokens         # 2048
+
+    # ── 阶段一：RUNNING ──────────────────────────────
+    req_index = 0
+    while req_index < len(self.running) and token_budget > 0:   # :285
+        request = self.running[req_index]                # ← list 顺序，和调度策略无关
+        ...
+        while True:
+            new_blocks = kv_cache_manager.allocate_slots(...)
+            if new_blocks is not None: break
+            preempted_req = self.running.pop()           # :407 ← LIFO 抢占
+            self.waiting.prepend_request(preempted_req)  # :419
+        token_budget -= num_new_tokens
+
+    # ── 阶段二：WAITING ─────────────────────────────
+    if not preempted_reqs:                               # :491
+        while self.waiting and token_budget > 0:         # :492
+            if len(self.running) == self.max_num_running_reqs:
+                break                                    # :494
+            request = self.waiting.peek_request()        # :497 ★ 调度策略唯一的接入点
+            ... 若干 skip 条件（remote KV / FSM / LoRA / 超长 prefill）
+            new_blocks = allocate_slots(...)
+            if new_blocks is None: break                 # :658 ← 停掉整个接纳循环
+            request = self.waiting.pop_request()         # :677
+            self.running.append(request)                 # :686
+```
+
+**调度策略只影响 `:497` 的 `peek_request()`——决定"下一个被接纳的是谁"。**
+
+它**不**影响：
+
+| 环节 | 实际由什么决定 |
+|---|---|
+| running 请求的 token 预算分配 | `self.running` 的 **list 顺序**（按接纳时间，等于 FCFS） |
+| 抢占受害者选择 | **LIFO**（`self.running.pop()`），所有策略一样 |
+| KV cache 分配本身 | `kv_cache_manager`，和策略无关 |
+
+<details><summary><b>追问：这个接入点在哪些情况下会被削弱？</b></summary>
+
+四处：
+
+**1. `if not preempted_reqs:`（:491）** —— 本轮只要发生过抢占，**整个接纳阶段跳过**，调度策略那一步零影响。
+
+**2. `if len(self.running) == max_num_running_reqs: break`（:494）** —— 只有空出槽位时才有话语权。
+
+量化：rate 16 时跑完 1000 条用 114 秒，step 14 ms → 约 **8,143 个 step**，但只有 **1000 次接纳**。
+
+> **平均每 8 个 step 才做一次调度决策。** 决策频率由**完成率**决定，不是 step 率。整场实验一共 1000 次选择，每次从平均 240 条深的队列里挑一个——**7.4× 的 p50 改善全部来自这 1000 次选择**。
+
+**3. `if new_blocks is None: break`（:658）** —— KV 分配失败会**停掉整个接纳循环**，不是跳过这一条。所以选中的队头如果拿不到 KV，**后面谁也进不来**；换个顺序本可以先放一条小的进去。我的配置 KV 用 2%，不触发。
+
+**4. `token_budget`** 由阶段一先消耗。32 条 decode 各要 1 个 token，2048 的预算只用掉 32——**余量 64 倍，不是约束**。真正的约束是 `max_num_running_reqs=32`。
+</details>
+
+<details><summary><b>追问：还能接在哪？为什么没接？</b></summary>
+
+| 可接入点 | 现在是什么 | 接入能改变什么 | 我的配置下有效吗 |
+|---|---|---|---|
+| **接纳顺序**（:497） | `peek_request()` | ✅ 已接入 | ✅ **唯一生效的** |
+| **抢占受害者**（:407） | LIFO | 按"剩余工作量/已投入"挑受害者，少浪费重算 | ❌ 抢占 0 次 |
+| **接纳的批量决策**（:492 循环） | 贪心取队头 | 对 token_budget 做背包，一次塞进最优组合 | ❌ budget 不是约束 |
+| **running 的预算分配**（:285） | list 顺序 | 让快完成的先推进，更快腾出槽位 | ❌ decode 每条只要 1 token |
+
+**后三个在我的配置下全是死的**——并发被 `max_num_seqs=32` 卡死、KV 只用 2%、token 预算余量 64 倍。
+
+这和我测出的结论闭环：**调度在这个配置下只能影响"谁先进场"，进场之后的一切都和它无关。** 所以吞吐必然守恒，能动的只有等待时间的分布。
+
+**要让后三个接入点活过来，必须让显存成为约束**（`max_num_seqs=512`）。那时抢占会发生、KV 分配会失败、背包决策才有意义——而这恰恰是论文报告吞吐增益的那条通路。
+</details>
+
+### Q3.3 KV cache 是怎么管理的？你测到多少？
 
 **PagedAttention**：KV cache 按固定大小的 block 分配（类似虚拟内存分页），避免为每条请求预留 `max_model_len` 的连续空间造成的内部碎片。
 
@@ -181,7 +257,7 @@ grep -ci "preempt" results/bench_*/server_*.log   # 五个臂全是 0
 和 KV 2% 的利用率互相印证——显存压力根本不存在。这是后面"吞吐守恒"论证的一环。
 </details>
 
-### Q3.3 什么时候会发生抢占？语义是什么？
+### Q3.4 什么时候会发生抢占？语义是什么？
 
 KV cache 不够给 running 的请求分配下一个 token 时：
 
@@ -210,7 +286,7 @@ self.waiting.prepend_request(preempted_req) # 放回等待队列
 这也是为什么"调度能不能减少抢占"是一条真实的吞吐提升路径——**在显存紧张的配置下**。我的配置下 KV 用 2%，这条路不存在。
 </details>
 
-### Q3.4 chunked prefill 有什么影响？
+### Q3.5 chunked prefill 有什么影响？
 
 日志：`Chunked prefill is enabled with max_num_batched_tokens=2048`。
 
@@ -220,7 +296,7 @@ prefill 和 decode **共享每个 step 的 token 预算**。一条长 prompt 的
 
 **代价**：prefill 会挤占 decode 的 token 预算。我的 workload 平均输入 102 token，prefill 占比很小，不是瓶颈。
 
-### Q3.5 prefill 和 decode 的性能特征为什么不同？
+### Q3.6 prefill 和 decode 的性能特征为什么不同？
 
 | | prefill | decode |
 |---|---|---|
